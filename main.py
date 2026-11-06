@@ -1,4 +1,5 @@
 import os
+import logging
 import requests
 import datetime
 import caldav
@@ -9,9 +10,16 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.background import BackgroundScheduler
 
+# Configuration des logs en mode INFO visible dans Docker
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("RunningCoachAgent")
+
 app = FastAPI()
 
-# Configuration
+# Configuration des variables d'environnement
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -20,14 +28,72 @@ RADICALE_READONLY_URLS = os.getenv("RADICALE_READONLY_URLS", "")
 RADICALE_USER = os.getenv("RADICALE_USER")
 RADICALE_PASS = os.getenv("RADICALE_PASS")
 DREEVE_API_KEY = os.getenv("DREEVE_API_KEY")
-DREEVE_API_URL = os.getenv("DREEVE_API_URL", "https://sport.hentgen.ovh")
+DREEVE_URL = os.getenv("DREEVE_API_URL", "https://sport.hentgen.ovh")
 CITY_LAT_LON = (48.8566, 2.3522)
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 telegram_app = None
 
 # ------------------------------------------------------------------
-# OUTILS (LECTURE SEULE POUR DREEVE & MÉTÉO / CRUD RADICALE)
+# TEST DE CONNECTIVITÉ LOGUÉ AU DÉMARRAGE
+# ------------------------------------------------------------------
+
+def verify_services_connectivity():
+    logger.info("=== LANCE LE TEST DE CONNECTIVITÉ DES SERVICES ===")
+    
+    # 1. Test Dreeve (Status + Training Load)
+    if not DREEVE_API_KEY:
+        logger.error("[DREEVE] DREEVE_API_KEY n'est pas configurée !")
+    else:
+        headers = {"Authorization": f"Bearer {DREEVE_API_KEY}", "Accept": "application/json"}
+        base_url = DREEVE_URL.rstrip('/')
+        
+        try:
+            res_status = requests.get(f"{base_url}/api/v1/status", headers=headers, timeout=5)
+            if res_status.status_code == 200:
+                logger.info("[DREEVE] Statut API OK : Connexion établie et token valide.")
+            else:
+                logger.warning(f"[DREEVE] Statut API renvoie un code HTTP {res_status.status_code} : {res_status.text}")
+        except Exception as e:
+            logger.error(f"[DREEVE] Erreur critique de connexion à l'URL {base_url} : {e}")
+
+        try:
+            res_load = requests.get(f"{base_url}/api/v1/metrics/training-load", headers=headers, timeout=5)
+            if res_load.status_code == 200:
+                data = res_load.json()
+                logger.info(f"[DREEVE] Training Load récupéré avec succès — CTL: {data.get('ctl')}, ATL: {data.get('atl')}")
+            else:
+                logger.warning(f"[DREEVEE] Training Load refusé (HTTP {res_load.status_code}) : {res_load.text}")
+        except Exception as e:
+            logger.error(f"[DREEVE] Impossible de récupérer le training load : {e}")
+
+    # 2. Test Météo (Open-Meteo)
+    try:
+        lat, lon = CITY_LAT_LON
+        weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&timezone=auto"
+        res_weather = requests.get(weather_url, timeout=5)
+        if res_weather.status_code == 200:
+            logger.info("[METEO] Open-Meteo OK : Prévisions accessibles.")
+        else:
+            logger.warning(f"[METEO] Open-Meteo a répondu avec le code {res_weather.status_code}")
+    except Exception as e:
+        logger.error(f"[METEO] Erreur de connexion Open-Meteo : {e}")
+
+    # 3. Test Radicale / CalDAV
+    if not RADICALE_URL:
+        logger.warning("[RADICALE] RADICALE_URL n'est pas définie.")
+    else:
+        try:
+            client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
+            client_cal.principal()
+            logger.info("[RADICALE] CalDAV OK : Connexion à l'agenda établie avec succès.")
+        except Exception as e:
+            logger.error(f"[RADICALE] Échec de connexion au calendrier CalDAV : {e}")
+
+    logger.info("=== FIN DU TEST DE CONNECTIVITÉ ===")
+
+# ------------------------------------------------------------------
+# OUTILS (LECTURE DREEVE & MÉTÉO / CRUD RADICALE)
 # ------------------------------------------------------------------
 
 def get_weather_forecast():
@@ -43,43 +109,47 @@ def get_weather_forecast():
 
 def get_dreeve_data():
     """
-    Interroge l'API REST officielle de Dreeve en lecture seule (activités et métriques).
+    Interroge l'API REST officielle de Dreeve pour la charge (CTL/ATL) et les activités récentes.
     """
     if not DREEVE_API_KEY:
         return "Clé Dreeve non configurée."
 
-    base_url = DREEVE_API_URL.rstrip('/')
+    base_url = DREEVE_URL.rstrip('/')
     headers = {
         "Authorization": f"Bearer {DREEVE_API_KEY}",
         "Accept": "application/json"
     }
 
     try:
-        # 1. Vérification du statut et récupération des activités récentes
-        res_act = requests.get(f"{base_url}/api/v1/activities", headers=headers, timeout=8)
-        
-        # 2. Récupération optionnelle de la charge d'entraînement (CTL/ATL) si l'endpoint répond
-        res_metrics = requests.get(f"{base_url}/api/v1/metrics/training-load", headers=headers, timeout=5)
-        
         output_parts = []
         
-        if res_act.status_code == 200:
-            activities = res_act.json()
-            summary_list = []
-            for act in activities[:3]:
-                name = act.get("name", "Sortie")
-                date = act.get("start_date", "Date inconnue")
-                distance = act.get("distance", 0) / 1000
-                summary_list.append(f"- {date} : {name} ({distance:.1f} km)")
-            if summary_list:
-                output_parts.append("Dernières activités Dreeve :\n" + "\n".join(summary_list))
+        # 1. Métriques de charge (Training Load : CTL, ATL, TSB...)
+        res_load = requests.get(f"{base_url}/api/v1/metrics/training-load", headers=headers, timeout=8)
+        if res_load.status_code == 200:
+            load_data = res_load.json()
+            output_parts.append(
+                f"- CTL (Forme) : {load_data.get('ctl', 'N/A')}\n"
+                f"- ATL (Fatigue) : {load_data.get('atl', 'N/A')}\n"
+                f"- TSB (Fraîcheur) : {load_data.get('tsb', {}).get('value', 'N/A')} ({load_data.get('tsb', {}).get('status', '')})"
+            )
 
-        if res_metrics.status_code == 200:
-            metrics = res_metrics.json()
-            output_parts.append(f"Métriques de charge Dreeve : {str(metrics)[:300]}")
+        # 2. Activités récentes via GET /api/v1/activities
+        res_act = requests.get(f"{base_url}/api/v1/activities?pagination[size]=3", headers=headers, timeout=8)
+        if res_act.status_code == 200:
+            data = res_act.json()
+            activities = data.get("activities", [])
+            summary_list = []
+            for act in activities:
+                name = act.get("name", "Sortie")
+                date = act.get("startDateLocal", "Date inconnue")
+                # Gestion de la distance si présente dans l'objet
+                summary_list.append(f"- {date} : {name}")
+            if summary_list:
+                output_parts.append("Dernières activités :\n" + "\n".join(summary_list))
 
         return "\n".join(output_parts) if output_parts else "Aucune donnée Dreeve disponible."
     except Exception as e:
+        logger.error(f"Erreur lors de la récupération des données Dreeve : {e}")
         return f"Erreur requête API Dreeve : {str(e)}"
 
 def fetch_events_from_calendar(client_cal, url, days_ahead):
@@ -208,7 +278,7 @@ Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
 Règles strictes :
 1. INTERDICTION FORMELLE D'UTILISER DES TABLEAUX (pas de caractère `|`). Utilise exclusivement des listes à puces (`-`).
 2. Utilise un Markdown simple et propre (gras avec `*`).
-3. Dreeve est en lecture seule stricte : tu peux consulter les activités et métriques remontées, mais tu n'écris jamais dedans. Tu gères l'écriture/modification/suppression uniquement dans l'agenda Radicale via les outils fournis.
+3. Dreeve est en lecture seule stricte : tu consultes la charge (CTL/ATL/TSB) et les activités remontées, mais tu n'écris jamais dedans. Tu gères l'écriture/modification/suppression uniquement dans l'agenda Radicale.
 4. Sois court, percutant et ne coupe jamais tes phrases.
 """
 
@@ -223,7 +293,7 @@ Message de l'utilisateur : "{user_prompt}"
 DONNÉES EN TEMPS RÉEL DU SYSTÈME :
 - Prévisions Météo : {weather_data}
 - Agendas Radicale : {calendar_data}
-- Données Dreeve (Lecture seule) : {dreeve_data}
+- Données Dreeve & Charge (Lecture seule) : {dreeve_data}
 """
 
     messages = [{"role": "user", "content": full_prompt}]
@@ -303,6 +373,10 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
 @app.on_event("startup")
 async def startup_event():
     global telegram_app
+    
+    # Exécution du test de connectivité logué au démarrage
+    verify_services_connectivity()
+
     if TELEGRAM_BOT_TOKEN:
         telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
