@@ -119,7 +119,15 @@ Contexte actuel :
         ]
     )
 
-    reply_text = response.content[0].text
+    reply_text = ""
+    for block in response.content:
+        if getattr(block, "type", None) == "text":
+            reply_text = block.text
+            break
+
+    if not reply_text:
+        reply_text = "Désolé, je n'ai pas pu générer de réponse."
+
     await update.message.reply_text(reply_text)
 
 telegram_app = None
