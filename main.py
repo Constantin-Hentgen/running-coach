@@ -41,49 +41,48 @@ def get_weather_forecast():
     except Exception:
         return {}
 
+import asyncio
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+
 def get_dreeve_data():
     """
-    Interroge le serveur MCP Dreeve en effectuant le handshake JSON-RPC 
-    exigé par le protocole (initialize + resources/list).
+    Connecte le client MCP officiel au serveur Dreeve via SSE avec le Bearer token.
     """
-    url = DREEVE_MCP_URL
-    if not url or not url.startswith("http") or not DREEVE_MCP_KEY:
+    if not DREEVE_MCP_URL or not DREEVE_MCP_KEY:
         return "Dreeve non configuré."
-        
-    headers = {
-        "Authorization": f"Bearer {DREEVE_MCP_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
 
+    headers = {"Authorization": f"Bearer {DREEVE_MCP_KEY}"}
+
+    async def _fetch():
+        try:
+            async with sse_client(DREEVE_MCP_URL, headers=headers) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    
+                    # Récupération des ressources exposées par Dreeve (CTL, ATL, activités...)
+                    resources = await session.list_resources()
+                    
+                    # Si des ressources existent, on lit la première ou le résumé
+                    if resources.resources:
+                        res_content = await session.read_resource(resources.resources[0].uri)
+                        return f"Données Dreeve (MCP) : {res_content}"
+                    
+                    # Alternative : lister les outils si Dreeve expose des tools MCP
+                    tools = await session.list_tools()
+                    return f"Outils Dreeve disponibles via MCP : {[t.name for t in tools.tools]}"
+        except Exception as e:
+            return f"Erreur MCP Dreeve : {str(e)}"
+
+    # Exécution de la coroutine async depuis notre fonction synchrone
     try:
-        # 1. Étape d'initialisation MCP obligatoire pour éviter le HTTP 400
-        init_payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "running-coach-agent", "version": "1.0"}
-            }
-        }
-        requests.post(url, headers=headers, json=init_payload, timeout=5)
-
-        # 2. Requête pour lister les ressources d'entraînement
-        list_payload = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "resources/list",
-            "params": {}
-        }
-        res = requests.post(url, headers=headers, json=list_payload, timeout=8)
-        if res.status_code == 200:
-            return f"Données Dreeve (MCP) : {res.text[:1500]}"
-            
-        return f"Dreeve joignable mais réponse HTTP {res.status_code}"
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            return asyncio.run_coroutine_threadsafe(_fetch(), loop).result(timeout=10)
+        else:
+            return loop.run_until_complete(_fetch())
     except Exception as e:
-        return f"Dreeve temporairement injoignable ({str(e)})"
+        return f"Dreeve MCP injoignable ({str(e)})"
 
 def fetch_events_from_calendar(client_cal, url, days_ahead):
     try:
