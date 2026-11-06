@@ -109,7 +109,6 @@ def get_dreeve_data():
     try:
         output_parts = []
         
-        # Fetch direct des métriques de charge officielles (sans calculs intermédiaires)
         res_load = requests.get(f"{DREEVE_BASE_URL}/api/v1/metrics/training-load", headers=headers, timeout=8)
         if res_load.status_code == 200:
             load_data = res_load.json()
@@ -123,8 +122,9 @@ def get_dreeve_data():
                 f"- Jours de repos (7j) : {load_data.get('restDaysLast7Days', 'N/A')}"
             )
 
+        # Récupération explicite des 20 derniers trainings
         res_act = requests.get(
-            f"{DREEVE_BASE_URL}/api/v1/activities?filters[sportType]=Run&pagination[size]=100", 
+            f"{DREEVE_BASE_URL}/api/v1/activities?filters[sportType]=Run&pagination[size]=20", 
             headers=headers, 
             timeout=8
         )
@@ -143,13 +143,13 @@ def get_dreeve_data():
                 longest_run = max(activities, key=get_dist_km, default=None)
                 
                 summary_list = []
-                for act in activities[:3]:
+                for act in activities:
                     name = act.get("name", "Sortie")
                     date = act.get("startDateLocal", "Date inconnue")[:10]
                     dist = get_dist_km(act)
                     summary_list.append(f"- {date} : {name} ({dist:.2f} km)")
                 
-                output_parts.append("🏃 *Dernières courses :*\n" + "\n".join(summary_list))
+                output_parts.append("🏃 *20 derniers runs :*\n" + "\n".join(summary_list))
                 
                 if longest_run:
                     l_dist = get_dist_km(longest_run)
@@ -193,12 +193,10 @@ def create_calendar_event(summary: str, start_time: str, end_time: str, descript
         dt_start = datetime.datetime.fromisoformat(start_time)
         dt_end = datetime.datetime.fromisoformat(end_time)
         
-        # Formatage propre de la description multi-lignes avec emojis si absents
         formatted_desc = description or "👟 Séance planifiée par ton coach.\n🎯 Restez rigoureux sur l'effort."
         
         calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary, description=formatted_desc)
         
-        # Refetch de vérification avec timeout simulé
         time.sleep(1)
         verify_events = calendar.search(start=dt_start, end=dt_end, event=True)
         created_ok = any(summary.lower() in str(e.vobject_instance.vevent.summary.value).lower() for e in verify_events)
@@ -296,14 +294,14 @@ def delete_calendar_event(summary_query: str = None, start_date: str = None, end
 TOOLS = [
     {
         "name": "create_calendar_event",
-        "description": "Crée un événement ou un repos dans l'unique calendrier Radicale (futur uniquement). La description DOIT être structurée sur plusieurs lignes avec des retours à la ligne (\\n) et des émojis pour la lisibilité.",
+        "description": "Crée un événement ou un repos dans l'unique calendrier Radicale (futur uniquement). La description DOIT être structurée sur plusieurs lignes avec des retours à la ligne (\\n) et des émojis.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "summary": {"type": "string"},
                 "start_time": {"type": "string", "description": "Format ISO datetime futur."},
                 "end_time": {"type": "string", "description": "Format ISO datetime futur."},
-                "description": {"type": "string", "description": "Détails structurés multi-lignes avec émojis (ex: '🏃 Échauffement\\n⚡ Corps de séance\\n🧘 Retour au calme')."}
+                "description": {"type": "string", "description": "Détails structurés multi-lignes avec émojis."}
             },
             "required": ["summary", "start_time", "end_time"]
         }
@@ -341,13 +339,13 @@ SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
 
 RÈGLES ABSOLUES DE COMMUNICATION :
-1. INTERDICTION FORMELLE DE DIRE "Opération terminée." : Tu dois TOUJOURS expliquer précisément quelle opération a été effectuée ou analysée (ex: "Analyse de la charge et de l'objectif de volume", "Mise à jour du planning de la semaine prochaine suite à la suppression du trail", etc.).
+1. INTERDICTION FORMELLE DE DIRE "Opération terminée." : Tu dois TOUJOURS expliquer précisément quelle opération a été effectuée ou analysée.
 2. TRANSPARENCE ET TEMPORALITÉ : Pour toute opération lourde (écriture calendrier, wipe), annonce immédiatement l'action en cours ("⏳ Connexion au calendrier Radicale en cours...").
-3. DESCRIPTIONS MULTI-LIGNES ET ÉMOJIS : Lorsque tu crées ou modifies des événements, structure TOUJOURS la description avec des retours à la ligne explicites (`\\n`) et des émojis sportifs pour une lisibilité parfaite dans le calendrier.
+3. DESCRIPTIONS MULTI-LIGNES ET ÉMOJIS : Structure TOUJOURS la description avec des retours à la ligne explicites (`\\n`) et des émojis sportifs.
 
 SÉCURITÉ ET ACCÈS UNIQUE :
 - Tu gères exclusivement l'unique calendrier configuré via RADICALE_URL.
-- Dreeve est en lecture seule stricte : récupère les données de charge brutes fournies sans recalculer les métriques.
+- Dreeve en lecture seule stricte : récupère les données de charge brutes et les 20 derniers trainings fournis.
 - PAS DE MODIFICATION DU PASSÉ.
 - Présentiel bureau : Lundi, mercredi, vendredi = pas de grosse séance.
 - Repos : planifiés de 08:00 à 23:00 le jour même.
@@ -363,7 +361,7 @@ async def ask_claude_with_tools(user_prompt, chat_id="default"):
 DONNÉES EN TEMPS RÉEL DU SYSTÈME :
 - Prévisions Météo : {weather_data}
 - Agenda Radicale Unique (30 prochains jours) : {calendar_data}
-- Données Dreeve & Charge (Lecture seule) : {dreeve_data}
+- Données Dreeve & Charge / 20 derniers runs (Lecture seule) : {dreeve_data}
 """
 
     history = USER_CONVERSATION_HISTORY[chat_id]
@@ -423,9 +421,8 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
             reply_text = block.text
             break
 
-    # Empêcher toute réponse vide ou "Opération terminée." générique
     if not reply_text or "opération terminée" in reply_text.lower():
-        reply_text = "⚡ Action traitée avec succès sur le système et l'agenda."
+        reply_text = "⚡ Analyse des 20 derniers runs et des métriques de charge effectuée avec succès."
 
     USER_CONVERSATION_HISTORY[chat_id].append({"role": "user", "content": user_prompt})
     if reply_text:
@@ -470,7 +467,7 @@ async def send_morning_briefing():
     if not telegram_app or not TELEGRAM_CHAT_ID:
         return
     prompt = (
-        "Réalise le briefing matinal. Analyse l'agenda Radicale existant, la météo et les données de charge Dreeve récupérées du jour. "
+        "Réalise le briefing matinal. Analyse l'agenda Radicale, la météo, les métriques de charge et les 20 derniers runs récupérés de Dreeve. "
         "Met à jour / planifie les 30 prochains jours dans Radicale. "
         "Fais un résumé Telegram ultra-concis, sobre, avec des descriptions structurées et des émojis."
     )
