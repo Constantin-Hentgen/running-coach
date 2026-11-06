@@ -20,7 +20,7 @@ RADICALE_READONLY_URLS = os.getenv("RADICALE_READONLY_URLS", "")
 RADICALE_USER = os.getenv("RADICALE_USER")
 RADICALE_PASS = os.getenv("RADICALE_PASS")
 DREEVE_API_KEY = os.getenv("DREEVE_API_KEY")
-DREEVE_URL = os.getenv("DREEVE_URL", "https://sport.hentgen.ovh")
+DREEVE_API_URL = os.getenv("DREEVE_API_URL", "https://sport.hentgen.ovh")
 CITY_LAT_LON = (48.8566, 2.3522)
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -48,7 +48,7 @@ def get_dreeve_data():
     if not DREEVE_API_KEY:
         return "Clé Dreeve non configurée."
 
-    base_url = DREEVE_URL.rstrip('/')
+    base_url = DREEVE_API_URL.rstrip('/')
     headers = {
         "Authorization": f"Bearer {DREEVE_API_KEY}",
         "Accept": "application/json"
