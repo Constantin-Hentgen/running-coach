@@ -2,6 +2,7 @@ import os
 import logging
 import requests
 import datetime
+from collections import defaultdict
 import caldav
 import anthropic
 from fastapi import FastAPI
@@ -38,6 +39,11 @@ CITY_LAT_LON = (48.8566, 2.3522)
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 telegram_app = None
 LAST_KNOWN_ACTIVITY_ID = None
+
+# GESTION DE LA MÉMOIRE / HISTORIQUE CONVERSATIONNEL (PAR USER / CHAT)
+# Stocke les N derniers messages d'échange pour chaque utilisateur
+USER_CONVERSATION_HISTORY = defaultdict(list)
+MAX_HISTORY_MESSAGES = 6  # 3 questions + 3 réponses
 
 # ------------------------------------------------------------------
 # TEST DE CONNECTIVITÉ LOGUÉ AU DÉMARRAGE
@@ -93,7 +99,7 @@ def verify_services_connectivity():
     logger.info("=== FIN DU TEST DE CONNECTIVITÉ ===")
 
 # ------------------------------------------------------------------
-# OUTILS (LECTURE DREEVE & MÉTÉO / CRUD RADICALE AVEC VERIFICATION)
+# OUTILS (LECTURE DREEVE & MÉTÉO / CRUD RADICALE)
 # ------------------------------------------------------------------
 
 def get_weather_forecast():
@@ -189,7 +195,7 @@ def fetch_events_from_calendar(client_cal, url, days_ahead):
     except Exception:
         return []
 
-def get_all_calendar_events(days_ahead=100):
+def get_all_calendar_events(days_ahead=30):
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
         all_events = []
@@ -211,10 +217,8 @@ def create_calendar_event(summary: str, start_time: str, end_time: str, descript
         dt_start = datetime.datetime.fromisoformat(start_time)
         dt_end = datetime.datetime.fromisoformat(end_time)
         
-        # 1. Écriture dans Radicale
         calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary, description=description or "")
         
-        # 2. Refetch de vérification immédiat pour s'assurer que c'est bien créé
         verify_events = calendar.search(start=dt_start, end=dt_end, event=True)
         created_ok = any(summary.lower() in str(e.vobject_instance.vevent.summary.value).lower() for e in verify_events)
         
@@ -356,35 +360,48 @@ TOOLS = [
 SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
 
-TRANSPARENCE ET RÉCAPITULATIF DE CRÉATION :
-- Quand tu lances des modifications ou des créations d'événements dans le calendrier, informe l'utilisateur que l'action est en cours ou confirmée par le serveur.
-- Fais TOUJOURS un petit message de récapitulatif clair après chaque création/modification de planning pour qu'il voie ce qui a été fait (titre, date, détails de la description).
+HISTORIQUE ET CONTEXTE :
+- Tu as accès aux échanges récents avec l'utilisateur pour conserver la continuité de la discussion.
+- Fais référence de manière naturelle aux questions ou préférences précédentes sans être lourd.
+
+TRANSPARENCE TOTALE ET RÈGLE DES ÉTAPES :
+1. STATUT EN COURS : Si tu t'apprêtes à exécuter des modifications ou créations d'événements, annonce-le clairement ("⏳ Action en cours...").
+2. VALIDATION ET RÉCAPITULATIF : Une fois les outils exécutés et validés par le serveur, envoie un récapitulatif net et précis de ce qui a été fait.
 
 PLANIFICATION GLISSANTE SUR 30 JOURS :
 - Maintiens la planification sur les 30 prochains jours.
 
 STYLE & TON SOBRE :
 - Sois très sobre, direct et peu verbeux.
-- Conseils d'outfit/nutrition uniquement si pertinent (pluie, froid < 8°C, chaleur > 22°C, grosse séance).
+- Conseils outfit/nutrition uniquement si pertinent.
 - Listes à puces (`-`), gras (`*`), émojis sobres. ZÉRO TABLEAU (pas de `|`).
 - Dreeve en lecture seule stricte. Pas de modification du passé.
 """
 
-async def ask_claude_with_tools(user_prompt):
+async def ask_claude_with_tools(user_prompt, chat_id="default"):
     weather_data = get_weather_forecast()
     calendar_data = get_all_calendar_events(days_ahead=30)
     dreeve_data = get_dreeve_data()
     
-    full_prompt = f"""
-Message de l'utilisateur : "{user_prompt}"
-
+    # Injection du contexte système en temps réel
+    system_context_block = f"""
 DONNÉES EN TEMPS RÉEL DU SYSTÈME :
 - Prévisions Météo : {weather_data}
 - Agendas Radicale (30 prochains jours) : {calendar_data}
 - Données Dreeve & Charge (Lecture seule) : {dreeve_data}
 """
 
-    messages = [{"role": "user", "content": full_prompt}]
+    # Récupération de l'historique conversationnel récents du user
+    history = USER_CONVERSATION_HISTORY[chat_id]
+    
+    messages = []
+    # Copie de l'historique (les N derniers messages)
+    for msg in history[-MAX_HISTORY_MESSAGES:]:
+        messages.append(msg)
+        
+    # Ajout du message courant enrichi du contexte temps réel
+    current_message_content = f"{system_context_block}\n\nMessage de l'utilisateur : \"{user_prompt}\""
+    messages.append({"role": "user", "content": current_message_content})
     
     response = anthropic_client.messages.create(
         model="claude-haiku-5-5",
@@ -434,6 +451,15 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
             reply_text = block.text
             break
 
+    # Mise à jour du buffer d'historique de conversation
+    USER_CONVERSATION_HISTORY[chat_id].append({"role": "user", "content": user_prompt})
+    if reply_text:
+        USER_CONVERSATION_HISTORY[chat_id].append({"role": "assistant", "content": reply_text})
+    
+    # Maintien du buffer à la taille maximale autorisée
+    if len(USER_CONVERSATION_HISTORY[chat_id]) > MAX_HISTORY_MESSAGES:
+        USER_CONVERSATION_HISTORY[chat_id] = USER_CONVERSATION_HISTORY[chat_id][-MAX_HISTORY_MESSAGES:]
+
     return reply_text if reply_text else "Opération terminée."
 
 # ------------------------------------------------------------------
@@ -465,7 +491,7 @@ async def check_new_activities_job():
                     dist = float(meters) / 1000.0 if meters else 0.0
                     
                     prompt = f"Je viens de terminer et d'uploader une nouvelle séance : '{name}' ({dist:.2f} km). Donne-moi un débrief très court, factuel et concis."
-                    reply_text = await ask_claude_with_tools(prompt)
+                    reply_text = await ask_claude_with_tools(prompt, chat_id=TELEGRAM_CHAT_ID)
                     await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚡ *Nouveau run détecté !*\n\n{reply_text}", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Erreur vérification automatique Dreeve : {e}")
@@ -478,15 +504,16 @@ async def send_morning_briefing():
         "Met à jour / planifie les 30 prochains jours dans Radicale en créant/ajustant les événements futurs. "
         "Fais un résumé Telegram ultra-concis, sobre, axé sur aujourd'hui et les grandes lignes du mois."
     )
-    reply_text = await ask_claude_with_tools(prompt)
+    reply_text = await ask_claude_with_tools(prompt, chat_id=TELEGRAM_CHAT_ID)
     await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=reply_text, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
+    chat_id = str(update.effective_chat.id)
     if not user_text:
         return
     
-    reply_text = await ask_claude_with_tools(user_text)
+    reply_text = await ask_claude_with_tools(user_text, chat_id=chat_id)
 
     try:
         await update.message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
