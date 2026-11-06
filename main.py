@@ -1,7 +1,6 @@
 import os
 import requests
 import datetime
-import traceback
 import caldav
 import anthropic
 from fastapi import FastAPI
@@ -20,15 +19,15 @@ RADICALE_URL = os.getenv("RADICALE_URL")
 RADICALE_READONLY_URLS = os.getenv("RADICALE_READONLY_URLS", "")
 RADICALE_USER = os.getenv("RADICALE_USER")
 RADICALE_PASS = os.getenv("RADICALE_PASS")
-DREEVE_MCP_KEY = os.getenv("DREEVE_MCP_KEY")
-DREEVE_MCP_URL = os.getenv("DREEVE_MCP_URL", "https://sport.hentgen.ovh/mcp")
+DREEVE_API_KEY = os.getenv("DREEVE_API_KEY")
+DREEVE_URL = os.getenv("DREEVE_URL", "https://sport.hentgen.ovh")
 CITY_LAT_LON = (48.8566, 2.3522)
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 telegram_app = None
 
 # ------------------------------------------------------------------
-# OUTILS
+# OUTILS (LECTURE SEULE POUR DREEVE & MÉTÉO / CRUD RADICALE)
 # ------------------------------------------------------------------
 
 def get_weather_forecast():
@@ -39,62 +38,49 @@ def get_weather_forecast():
         if res.status_code == 200:
             return res.json().get("daily", {})
         return {}
-    except Exception as e:
-        print(f"[ERROR] Météo: {e}")
+    except Exception:
         return {}
 
 def get_dreeve_data():
     """
-    Communique avec le serveur MCP Dreeve via une séquence JSON-RPC en POST.
+    Interroge l'API REST officielle de Dreeve en lecture seule (activités et métriques).
     """
-    if not DREEVE_MCP_URL or not DREEVE_MCP_KEY:
-        return "Dreeve non configuré."
+    if not DREEVE_API_KEY:
+        return "Clé Dreeve non configurée."
 
+    base_url = DREEVE_URL.rstrip('/')
     headers = {
-        "Authorization": f"Bearer {DREEVE_MCP_KEY}",
-        "Content-Type": "application/json",
+        "Authorization": f"Bearer {DREEVE_API_KEY}",
         "Accept": "application/json"
     }
 
     try:
-        session = requests.Session()
-        session.headers.update(headers)
+        # 1. Vérification du statut et récupération des activités récentes
+        res_act = requests.get(f"{base_url}/api/v1/activities", headers=headers, timeout=8)
+        
+        # 2. Récupération optionnelle de la charge d'entraînement (CTL/ATL) si l'endpoint répond
+        res_metrics = requests.get(f"{base_url}/api/v1/metrics/training-load", headers=headers, timeout=5)
+        
+        output_parts = []
+        
+        if res_act.status_code == 200:
+            activities = res_act.json()
+            summary_list = []
+            for act in activities[:3]:
+                name = act.get("name", "Sortie")
+                date = act.get("start_date", "Date inconnue")
+                distance = act.get("distance", 0) / 1000
+                summary_list.append(f"- {date} : {name} ({distance:.1f} km)")
+            if summary_list:
+                output_parts.append("Dernières activités Dreeve :\n" + "\n".join(summary_list))
 
-        # 1. Handshake d'initialisation MCP (JSON-RPC)
-        init_payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "running-coach", "version": "1.0"}
-            }
-        }
-        res_init = session.post(DREEVE_MCP_URL, json=init_payload, timeout=5)
-        if res_init.status_code != 200:
-            return f"Dreeve MCP refus init (HTTP {res_init.status_code})"
+        if res_metrics.status_code == 200:
+            metrics = res_metrics.json()
+            output_parts.append(f"Métriques de charge Dreeve : {str(metrics)[:300]}")
 
-        # 2. Notification de fin d'initialisation
-        session.post(DREEVE_MCP_URL, json={
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }, timeout=3)
-
-        # 3. Récupération des outils / données disponibles
-        tools_payload = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-            "params": {}
-        }
-        res_tools = session.post(DREEVE_MCP_URL, json=tools_payload, timeout=5)
-        if res_tools.status_code == 200:
-            return f"Données Dreeve (MCP) : {res_tools.text[:1500]}"
-
-        return f"Dreeve MCP connecté mais échec lecture (HTTP {res_tools.status_code})"
+        return "\n".join(output_parts) if output_parts else "Aucune donnée Dreeve disponible."
     except Exception as e:
-        return f"Erreur de connexion Dreeve MCP : {str(e)}"
+        return f"Erreur requête API Dreeve : {str(e)}"
 
 def fetch_events_from_calendar(client_cal, url, days_ahead):
     try:
@@ -175,7 +161,7 @@ def delete_calendar_event(summary_query: str):
         return f"Erreur suppression : {str(e)}"
 
 # ------------------------------------------------------------------
-# CONFIGURATION ANTHROPIC
+# CONFIGURATION ANTHROPIC (TOOLS & PROMPT)
 # ------------------------------------------------------------------
 
 TOOLS = [
@@ -219,16 +205,17 @@ TOOLS = [
 
 SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
-Règles strictes de formatage pour Telegram :
+Règles strictes :
 1. INTERDICTION FORMELLE D'UTILISER DES TABLEAUX (pas de caractère `|`). Utilise exclusivement des listes à puces (`-`).
 2. Utilise un Markdown simple et propre (gras avec `*`).
-3. Sois court, percutant et ne coupe jamais tes phrases.
+3. Dreeve est en lecture seule stricte : tu peux consulter les activités et métriques remontées, mais tu n'écris jamais dedans. Tu gères l'écriture/modification/suppression uniquement dans l'agenda Radicale via les outils fournis.
+4. Sois court, percutant et ne coupe jamais tes phrases.
 """
 
 async def ask_claude_with_tools(user_prompt):
     weather_data = get_weather_forecast()
     calendar_data = get_all_calendar_events()
-    dreeve_data = get_dreeve_data()  # <-- Appel synchrone sans 'await'
+    dreeve_data = get_dreeve_data()
     
     full_prompt = f"""
 Message de l'utilisateur : "{user_prompt}"
@@ -236,7 +223,7 @@ Message de l'utilisateur : "{user_prompt}"
 DONNÉES EN TEMPS RÉEL DU SYSTÈME :
 - Prévisions Météo : {weather_data}
 - Agendas Radicale : {calendar_data}
-- Données Dreeve (MCP) : {dreeve_data}
+- Données Dreeve (Lecture seule) : {dreeve_data}
 """
 
     messages = [{"role": "user", "content": full_prompt}]
