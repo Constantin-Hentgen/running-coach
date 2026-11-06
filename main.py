@@ -37,6 +37,7 @@ CITY_LAT_LON = (48.8566, 2.3522)
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 telegram_app = None
+LAST_KNOWN_ACTIVITY_ID = None
 
 # ------------------------------------------------------------------
 # TEST DE CONNECTIVITÉ LOGUÉ AU DÉMARRAGE
@@ -51,12 +52,10 @@ def verify_services_connectivity():
         masked_key = f"{DREEVE_API_KEY[:6]}...{DREEVE_API_KEY[-4:]}" if len(DREEVE_API_KEY) > 10 else "KEY_TOO_SHORT"
         logger.info(f"[DREEVE] Clé détectée (masquée) : {masked_key}")
 
-    # 1. Test Dreeve (Status + Training Load)
     if DREEVE_API_KEY:
         headers = {"Authorization": f"Bearer {DREEVE_API_KEY}", "Accept": "application/json"}
         
         target_status_url = f"{DREEVE_BASE_URL}/api/v1/status"
-        logger.info(f"[DREEVE] Test URL Statut : {target_status_url}")
         try:
             res_status = requests.get(target_status_url, headers=headers, timeout=5)
             logger.info(f"[DREEVE] Réponse Statut — HTTP {res_status.status_code} : {res_status.text}")
@@ -64,14 +63,12 @@ def verify_services_connectivity():
             logger.error(f"[DREEVE] Erreur de connexion à {target_status_url} : {e}")
 
         target_load_url = f"{DREEVE_BASE_URL}/api/v1/metrics/training-load"
-        logger.info(f"[DREEVE] Test URL Training Load : {target_load_url}")
         try:
             res_load = requests.get(target_load_url, headers=headers, timeout=5)
             logger.info(f"[DREEVE] Réponse Training Load — HTTP {res_load.status_code} : {res_load.text}")
         except Exception as e:
             logger.error(f"[DREEVE] Erreur training-load : {e}")
 
-    # 2. Test Météo (Open-Meteo)
     try:
         lat, lon = CITY_LAT_LON
         weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&timezone=auto"
@@ -83,7 +80,6 @@ def verify_services_connectivity():
     except Exception as e:
         logger.error(f"[METEO] Erreur Open-Meteo : {e}")
 
-    # 3. Test Radicale / CalDAV
     if not RADICALE_URL:
         logger.warning("[RADICALE] RADICALE_URL n'est pas définie.")
     else:
@@ -97,7 +93,7 @@ def verify_services_connectivity():
     logger.info("=== FIN DU TEST DE CONNECTIVITÉ ===")
 
 # ------------------------------------------------------------------
-# OUTILS (LECTURE DREEVE & MÉTÉO / CRUD RADICALE SÉCURISÉ FUTUR)
+# OUTILS (LECTURE DREEVE & MÉTÉO / CRUD RADICALE)
 # ------------------------------------------------------------------
 
 def get_weather_forecast():
@@ -231,7 +227,6 @@ def update_calendar_event(summary_query: str, new_summary: str = None, new_start
         
         for e in events:
             comp = e.vobject_instance.vevent
-            # SÉCURITÉ : Ignorer les événements passés
             event_end = comp.dtend.value
             if isinstance(event_end, datetime.date) and not isinstance(event_end, datetime.datetime):
                 event_end = datetime.datetime.combine(event_end, datetime.time.max).replace(tzinfo=datetime.timezone.utc)
@@ -262,7 +257,6 @@ def delete_calendar_event(summary_query: str = None, start_date: str = None, end
         calendar = client_cal.calendar(url=RADICALE_URL)
         now = datetime.datetime.now(datetime.timezone.utc)
         
-        # Mode Wipe : suppression sur une plage de dates (uniquement futur ou en cours)
         if start_date and end_date:
             dt_start = datetime.datetime.fromisoformat(start_date)
             dt_end = datetime.datetime.fromisoformat(end_date)
@@ -276,13 +270,11 @@ def delete_calendar_event(summary_query: str = None, start_date: str = None, end
                 elif event_end.tzinfo is None:
                     event_end = event_end.replace(tzinfo=datetime.timezone.utc)
                 
-                # Interdiction formelle de supprimer le passé
                 if event_end >= now:
                     e.delete()
                     count += 1
             return f"Succès : {count} événement(s) futur(s) supprimé(s) du {start_date} au {end_date}."
             
-        # Mode recherche par titre (uniquement futur)
         if summary_query:
             events = calendar.search(event=True)
             count = 0
@@ -307,7 +299,7 @@ def delete_calendar_event(summary_query: str = None, start_date: str = None, end
         return f"Erreur suppression : {str(e)}"
 
 # ------------------------------------------------------------------
-# CONFIGURATION ANTHROPIC (TOOLS & PROMPT)
+# CONFIGURATION ANTHROPIC (TOOLS & PROMPT SOBRE)
 # ------------------------------------------------------------------
 
 TOOLS = [
@@ -327,7 +319,7 @@ TOOLS = [
     },
     {
         "name": "update_calendar_event",
-        "description": "Modifie une séance dans l'agenda Radicale par recherche de titre (STRICTEMENT INTERdit de modifier le passé).",
+        "description": "Modifie une séance dans l'agenda Radicale par recherche de titre (INTERDICTION de modifier le passé).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -357,19 +349,16 @@ TOOLS = [
 SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
 
-RÈGLES ABSOLUES DU CALENDRIER & DU TEMPS :
-1. PAS DE MODIFICATION DU PASSÉ : Tu ne dois JAMAIS modifier, éditer ou supprimer un événement passé. Toutes les modifications ou suppressions doivent porter exclusivement sur des événements futurs.
-2. PRÉSENTIEL AU BUREAU : Le lundi, le mercredi et le vendredi, l'utilisateur est sur site. Pas de grosse séance/fractionné lourd ces jours-là (privilégier du repos ou du footing très léger).
-3. SÉANCES DE REPOS : Planifie TOUJOURS les jours de repos de 08:00:00 à 23:00:00 le jour même pour éviter les bugs de chevauchement.
-4. DÉTAILS DES SÉANCES : Remplis la description avec du détail utile (allures, blocs d'échauffement, RPE).
-5. WIPE DE PLANNING : Pour refaire une semaine, purge uniquement les jours futurs concernés.
+STYLE & TON SOBRE :
+- Sois très sobre, direct et peu verbeux. Pas de politesses superflues ou de longs discours.
+- N'ajoute des conseils d'équipement (outfit) ou de nutrition QUE si c'est réellement pertinent (ex: pluie, température < 8°C, chaleur > 22°C, séance > 1h15 ou fort fractionné). Sinon, n'en parle pas.
+- Jamais de généralités bateaux ("hydrate-toi bien", "mets des baskets"). Si tu donnes un conseil, il est ciblé et technique (ex: 🧥 *Coupe-vent déperlant + gants*, 🧪 *1 gel à T+45min*).
 
-FORMATAGE TELEGRAM STRICT :
-1. INTERDICTION FORMELLE D'UTILISER DES TABLEAUX (pas de caractère `|`). Utilise exclusivement des listes à puces (`-`).
-2. Utilise un Markdown simple et propre (gras avec `*`).
-3. Utilise des émojis pertinents et dynamiques (☀️, 🌧️, ❄️, 🏃‍♂️, 👟, ⚠️, 🏆, 🛌).
-4. Dreeve est en lecture seule stricte.
-5. Sois court, percutant et ne coupe jamais tes phrases.
+RÈGLES DU CALENDRIER :
+1. PAS DE MODIFICATION DU PASSÉ.
+2. PRÉSENTIEL : Lundi, mercredi, vendredi = bureau (pas de grosse séance).
+3. REPOS : Définis les repos de 08:00:00 à 23:00:00 le jour même.
+4. FORMAT TELEGRAM : Listes à puces (`-`), gras (`*`), émojis sobres. ZÉRO TABLEAU (pas de `|`).
 """
 
 async def ask_claude_with_tools(user_prompt):
@@ -439,13 +428,48 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
     return reply_text if reply_text else "Opération terminée."
 
 # ------------------------------------------------------------------
-# TELEGRAM & FASTAPI
+# JOBS AUTO : DEBRIEF NOVEAU RUN & BRIEFING MATINAL
 # ------------------------------------------------------------------
+
+async def check_new_activities_job():
+    """
+    Vérifie toutes les 15 minutes si une nouvelle activité a été uploadée sur Dreeve.
+    """
+    global LAST_KNOWN_ACTIVITY_ID, telegram_app, TELEGRAM_CHAT_ID
+    if not DREEVE_API_KEY or not telegram_app or not TELEGRAM_CHAT_ID:
+        return
+
+    headers = {"Authorization": f"Bearer {DREEVE_API_KEY}", "Accept": "application/json"}
+    try:
+        res = requests.get(f"{DREEVE_BASE_URL}/api/v1/activities?pagination[size]=1", headers=headers, timeout=5)
+        if res.status_code == 200:
+            activities = res.json().get("activities", [])
+            if activities:
+                latest = activities[0]
+                latest_id = latest.get("id")
+                
+                # Premier lancement : on enregistre sans notifier
+                if LAST_KNOWN_ACTIVITY_ID is None:
+                    LAST_KNOWN_ACTIVITY_ID = latest_id
+                    return
+                
+                # Détection d'un nouveau run !
+                if latest_id != LAST_KNOWN_ACTIVITY_ID:
+                    LAST_KNOWN_ACTIVITY_ID = latest_id
+                    name = latest.get("name", "Sortie")
+                    meters = latest.get("distanceInMeter") or latest.get("distance", 0)
+                    dist = float(meters) / 1000.0 if meters else 0.0
+                    
+                    prompt = f"Je viens de terminer et d'uploader une nouvelle séance : '{name}' ({dist:.2f} km). Donne-moi un débrief très court, factuel et concis."
+                    reply_text = await ask_claude_with_tools(prompt)
+                    await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚡ *Nouveau run détecté !*\n\n{reply_text}", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Erreur vérification automatique Dreeve : {e}")
 
 async def send_morning_briefing():
     if not telegram_app or not TELEGRAM_CHAT_ID:
         return
-    reply_text = await ask_claude_with_tools("Fais un briefing matinal ultra-concis pour aujourd'hui.")
+    reply_text = await ask_claude_with_tools("Fais le briefing matinal des 7 prochains jours : météo, séances prévues, ajustements si besoin (bureau lun/mer/ven). Restes sobre et concis.")
     await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=reply_text, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -474,7 +498,10 @@ async def startup_event():
         await telegram_app.updater.start_polling()
 
         scheduler = BackgroundScheduler()
+        # Briefing matinal à 08:00
         scheduler.add_job(send_morning_briefing, 'cron', hour=8, minute=0)
+        # Détection automatique de nouvel upload Dreeve toutes les 15 min
+        scheduler.add_job(check_new_activities_job, 'interval', minutes=15)
         scheduler.start()
 
 @app.on_event("shutdown")
