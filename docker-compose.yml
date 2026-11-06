@@ -6,8 +6,10 @@ services:
     ports:
       - "18000:8000"
     environment:
+      - TZ=Europe/Paris
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - RADICALE_URL=${RADICALE_URL}
       - RADICALE_USER=${RADICALE_USER}
       - RADICALE_PASS=${RADICALE_PASS}
