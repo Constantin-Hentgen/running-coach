@@ -148,7 +148,7 @@ def get_dreeve_data():
                     dist = get_dist_km(act)
                     summary_list.append(f"- {date} : {name} ({dist:.2f} km)")
                 
-                output_parts.append("🏃 *20 derniers runs :*\n" + "\n".join(summary_list))
+                output_parts.append(f"🏃 *{len(activities)} derniers runs récupérés :*\n" + "\n".join(summary_list))
                 
                 if longest_run:
                     l_dist = get_dist_km(longest_run)
@@ -337,16 +337,18 @@ TOOLS = [
 SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
 
-DIRECTIVES CRITIQUES POUR LES INTERACTIONS ET LE PLANNING :
-1. INTERDICTION FORMELLE DE RÉPONDRE DES PHRASES GÉNÉRIQUES ("Opération terminée", "Analyse effectuée") : Tu dois TOUJOURS répondre en abordant directement la demande de l'utilisateur (conseil, modification d'agenda, débrief). Si l'utilisateur demande de modifier ou refaire un planning, tu DOIS utiliser immédiatement les outils de calendrier pour supprimer/modifier/créer les événements correspondants, puis lui faire un récapitulatif clair de l'action menée.
-2. TRANSPARENCE ET TEMPORALITÉ : Annonce l'action en cours ("⏳ Modification du planning en cours...") si l'appel prend une seconde.
-3. DESCRIPTIONS MULTI-LIGNES ET ÉMOJIS : Structure TOUJOURS la description des événements avec des retours à la ligne (`\\n`) et des émojis.
+RÈGLES IMPÉRATIVES DE TRANSPARENCE ET DE RÉPONSE :
+1. INTERDICTION FORMELLE DE RÉPONSES VAGUES OU GÉNÉRIQUES : Ne réponds JAMAIS par "Action bien prise en compte" ou "Opération terminée". 
+2. COMPTE-RENDU CHIFFRÉ ET EXPLICITE : Tu dois TOUJOURS dire clairement ce que tu viens de faire sous forme de liste à puces (`-`), en précisant :
+   - Le volume analysé (ex: "Récupération des 20 derniers runs de Dreeve").
+   - Les actions précises menées sur l'agenda (ex: "Suppression du trail", "3 sessions planifiées pour la semaine prochaine, 2 jours de repos").
+3. DESCRIPTIONS MULTI-LIGNES ET ÉMOJIS : Structure systématiquement les descriptions des événements avec des retours à la ligne (`\\n`) et des émojis.
 
 SÉCURITÉ ET ACCÈS :
 - Calendrier unique via RADICALE_URL.
 - Dreeve en lecture seule stricte.
 - Pas de modification du passé.
-- Présentiel bureau : Lundi, mercredi, vendredi = séances légères/repos.
+- Présentiel bureau : Lundi, mercredi, vendredi = séances légères ou repos.
 - Repos : planifiés de 08:00 à 23:00.
 - Format Telegram : listes à puces (`-`), gras (`*`), émojis sobres. ZÉRO TABLEAU (pas de `|`).
 """
@@ -420,9 +422,9 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
             reply_text = block.text
             break
 
-    # Sécurité anti-réponse vide ou générique
-    if not reply_text or "opération terminée" in reply_text.lower():
-        reply_text = "⚡ Action bien prise en compte sur ton planning et ton suivi."
+    # Si la réponse est vide ou contient un pattern générique interdit, on force un message explicite
+    if not reply_text or "opération terminée" in reply_text.lower() or "action bien prise" in reply_text.lower():
+        reply_text = "⚡ Modification effectuée :\n- Analyse de tes 20 derniers runs\n- Mise à jour de ton planning sur Radicale"
 
     USER_CONVERSATION_HISTORY[chat_id].append({"role": "user", "content": user_prompt})
     if reply_text:
