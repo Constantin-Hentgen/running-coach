@@ -21,35 +21,34 @@ RADICALE_USER = os.getenv("RADICALE_USER")
 RADICALE_PASS = os.getenv("RADICALE_PASS")
 DREEVE_MCP_KEY = os.getenv("DREEVE_MCP_KEY")
 DREEVE_MCP_URL = os.getenv("DREEVE_MCP_URL", "https://sport.hentgen.ovh/mcp")
-DREEVE_API_URL = os.getenv("DREEVE_API_URL", "https://sport.hentgen.ovh/api/v1")
-CITY_LAT_LON = (48.8566, 2.3522)  # Coordonnées (ex: Paris)
+CITY_LAT_LON = (48.8566, 2.3522)
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 telegram_app = None
 
 # ------------------------------------------------------------------
-# OUTILS (Météo, Dreeve, Radicale)
+# OUTILS
 # ------------------------------------------------------------------
 
 def get_weather_forecast():
-    """Récupère la météo Open-Meteo avec retry et timeout étendu."""
     try:
         lat, lon = CITY_LAT_LON
         url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max&timezone=auto"
         res = requests.get(url, timeout=10)
         if res.status_code == 200:
             return res.json().get("daily", {})
-        return f"Avertissement Météo : Code HTTP {res.status_code}"
-    except Exception as e:
-        return f"Erreur de connexion Météo : {str(e)}"
+        return {}
+    except Exception:
+        return {}
 
 def get_dreeve_data():
     """
-    Récupère les données Dreeve. 
-    Tente l'API REST ou l'endpoint MCP avec le header de Bearer Token drvm_...
+    Interroge le serveur MCP Dreeve en effectuant le handshake JSON-RPC 
+    exigé par le protocole (initialize + resources/list).
     """
-    if not DREEVE_MCP_KEY:
-        return "Clé DREEVE_MCP_KEY non configurée."
+    url = DREEVE_MCP_URL
+    if not url or not url.startswith("http") or not DREEVE_MCP_KEY:
+        return "Dreeve non configuré."
         
     headers = {
         "Authorization": f"Bearer {DREEVE_MCP_KEY}",
@@ -57,34 +56,34 @@ def get_dreeve_data():
         "Accept": "application/json"
     }
 
-    # 1. Tentative via API REST Dreeve (statistiques / dernières activités)
     try:
-        api_res = requests.get(f"{DREEVE_API_URL}/activities", headers=headers, timeout=5)
-        if api_res.status_code == 200:
-            return api_res.text[:2000]
-    except Exception:
-        pass
-
-    # 2. Fallback / Requete directe vers /mcp
-    try:
-        res = requests.get(DREEVE_MCP_URL, headers=headers, timeout=8)
-        if res.status_code == 200:
-            return res.text[:2000]
-        elif res.status_code == 405:
-            # Si le serveur MCP exige un POST JSON-RPC pour initialiser la connexion
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/list",
-                "params": {}
+        # 1. Étape d'initialisation MCP obligatoire pour éviter le HTTP 400
+        init_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "running-coach-agent", "version": "1.0"}
             }
-            post_res = requests.post(DREEVE_MCP_URL, headers=headers, json=payload, timeout=8)
-            if post_res.status_code == 200:
-                return f"Outils Dreeve MCP disponibles : {post_res.text[:1500]}"
-            return f"Serveur MCP Dreeve accessible mais nécessite un payload JSON-RPC (HTTP {post_res.status_code})."
-        return f"Statut Dreeve MCP : HTTP {res.status_code}"
+        }
+        requests.post(url, headers=headers, json=init_payload, timeout=5)
+
+        # 2. Requête pour lister les ressources d'entraînement
+        list_payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "resources/list",
+            "params": {}
+        }
+        res = requests.post(url, headers=headers, json=list_payload, timeout=8)
+        if res.status_code == 200:
+            return f"Données Dreeve (MCP) : {res.text[:1500]}"
+            
+        return f"Dreeve joignable mais réponse HTTP {res.status_code}"
     except Exception as e:
-        return f"Erreur de connexion Dreeve MCP : {str(e)}"
+        return f"Dreeve temporairement injoignable ({str(e)})"
 
 def fetch_events_from_calendar(client_cal, url, days_ahead):
     try:
@@ -165,7 +164,7 @@ def delete_calendar_event(summary_query: str):
         return f"Erreur suppression : {str(e)}"
 
 # ------------------------------------------------------------------
-# CONFIGURATION ANTHROPIC (Tools & System Prompt)
+# CONFIGURATION ANTHROPIC
 # ------------------------------------------------------------------
 
 TOOLS = [
@@ -209,12 +208,10 @@ TOOLS = [
 
 SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
-Tu communiques via Telegram en Markdown valide.
-
-DIRECTIVES SUR LES DONNÉES :
-1. N'affirme PAS que tu n'as pas accès à la météo ou à Dreeve sauf si le contexte t'indique explicitement une erreur de connexion réseau.
-2. Si des données sont temporairement indisponibles, fais au mieux avec les éléments de l'agenda Radicale pour planifier les séances.
-3. Utilise les outils de calendrier pour créer, modifier ou supprimer des séances quand l'utilisateur te le demande.
+Règles strictes de formatage pour Telegram :
+1. INTERDICTION FORMELLE D'UTILISER DES TABLEAUX (pas de caractère `|`). Utilise exclusivement des listes à puces (`-`).
+2. Utilise un Markdown simple et propre (gras avec `*`).
+3. Sois court, percutant et ne coupe jamais tes phrases.
 """
 
 def ask_claude_with_tools(user_prompt):
@@ -227,15 +224,16 @@ Message de l'utilisateur : "{user_prompt}"
 
 DONNÉES EN TEMPS RÉEL DU SYSTÈME :
 - Prévisions Météo : {weather_data}
-- Agendas Radicale (Running & Read-Only) : {calendar_data}
-- Données / Statut Dreeve (MCP) : {dreeve_data}
+- Agendas Radicale : {calendar_data}
+- Données Dreeve (MCP) : {dreeve_data}
 """
 
     messages = [{"role": "user", "content": full_prompt}]
     
+    # max_tokens augmenté à 2048 pour éviter les troncatures
     response = anthropic_client.messages.create(
         model="claude-haiku-5-5",
-        max_tokens=1500,
+        max_tokens=2048,
         system=SYSTEM_PROMPT,
         tools=TOOLS,
         messages=messages
@@ -268,7 +266,7 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
         
         final_response = anthropic_client.messages.create(
             model="claude-haiku-5-5",
-            max_tokens=1500,
+            max_tokens=2048,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages
