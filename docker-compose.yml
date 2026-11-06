@@ -4,7 +4,7 @@ services:
     container_name: running_coach_agent
     restart: always
     ports:
-      - "8000:8000"
+      - "18000:8000"
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
