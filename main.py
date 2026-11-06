@@ -97,7 +97,7 @@ def verify_services_connectivity():
     logger.info("=== FIN DU TEST DE CONNECTIVITÉ ===")
 
 # ------------------------------------------------------------------
-# OUTILS (LECTURE DREEVE & MÉTÉO / CRUD RADICALE)
+# OUTILS (LECTURE DREEVE & MÉTÉO / CRUD RADICALE SÉCURISÉ FUTUR)
 # ------------------------------------------------------------------
 
 def get_weather_forecast():
@@ -146,24 +146,31 @@ def get_dreeve_data():
             activities = data.get("activities", [])
             
             if activities:
-                longest_run = max(activities, key=lambda x: x.get("distance", 0), default=None)
+                def get_dist_km(act):
+                    meters = act.get("distanceInMeter")
+                    if meters is None:
+                        meters = act.get("distance", 0)
+                    return float(meters) / 1000.0 if meters else 0.0
+
+                longest_run = max(activities, key=get_dist_km, default=None)
                 
                 summary_list = []
                 for act in activities[:3]:
                     name = act.get("name", "Sortie")
                     date = act.get("startDateLocal", "Date inconnue")[:10]
-                    dist = act.get("distance", 0) / 1000
+                    dist = get_dist_km(act)
                     summary_list.append(f"- {date} : {name} ({dist:.2f} km)")
                 
                 output_parts.append("🏃 *Dernières courses :*\n" + "\n".join(summary_list))
                 
-                if longest_run and longest_run.get("distance", 0) > 0:
-                    l_dist = longest_run.get("distance", 0) / 1000
-                    l_date = longest_run.get("startDateLocal", "")[:10]
-                    l_name = longest_run.get("name", "Course")
-                    output_parts.append(f"🏆 *Record de distance (Run le plus long) :* {l_dist:.2f} km le {l_date} ('{l_name}')")
+                if longest_run:
+                    l_dist = get_dist_km(longest_run)
+                    if l_dist > 0:
+                        l_date = longest_run.get("startDateLocal", "")[:10]
+                        l_name = longest_run.get("name", "Course")
+                        output_parts.append(f"🏆 *Record de distance (Run le plus long) :* {l_dist:.2f} km le {l_date} ('{l_name}')")
 
-        return "\n\n".join(output_parts) if output_parts else "Aucuna donnée Dreeve disponible."
+        return "\n\n".join(output_parts) if output_parts else "Aucune donnée Dreeve disponible."
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des données Dreeve : {e}")
         return f"Erreur requête API Dreeve : {str(e)}"
@@ -177,16 +184,18 @@ def fetch_events_from_calendar(client_cal, url, days_ahead):
         results = []
         for e in events:
             component = e.vobject_instance.vevent
+            desc = str(component.description.value) if hasattr(component, "description") else ""
             results.append({
                 "summary": str(component.summary.value),
                 "start": str(component.dtstart.value),
-                "end": str(component.dtend.value)
+                "end": str(component.dtend.value),
+                "description": desc
             })
         return results
     except Exception:
         return []
 
-def get_all_calendar_events(days_ahead=7):
+def get_all_calendar_events(days_ahead=14):
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
         all_events = []
@@ -200,65 +209,100 @@ def get_all_calendar_events(days_ahead=7):
     except Exception as e:
         return f"Erreur Radicale : {str(e)}"
 
-def create_calendar_event(summary: str, start_time: str, end_time: str):
+def create_calendar_event(summary: str, start_time: str, end_time: str, description: str = None):
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
         calendar = client_cal.calendar(url=RADICALE_URL)
         
-        # Gestion intelligente : si les formats sont YYYY-MM-DD, on crée un événement de journée entière (All-day)
-        if len(start_time) == 10 and len(end_time) == 10 and "T" not in start_time:
-            dt_start = datetime.date.fromisoformat(start_time)
-            dt_end = datetime.date.fromisoformat(end_time)
-            if dt_end <= dt_start:
-                dt_end = dt_start + datetime.timedelta(days=1)
-            calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary)
-        else:
-            dt_start = datetime.datetime.fromisoformat(start_time)
-            dt_end = datetime.datetime.fromisoformat(end_time)
-            calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary)
-            
-        return f"Succès : séance '{summary}' créée."
+        dt_start = datetime.datetime.fromisoformat(start_time)
+        dt_end = datetime.datetime.fromisoformat(end_time)
+        
+        calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary, description=description or "")
+        return f"Succès : événement '{summary}' créé de {start_time} à {end_time}."
     except Exception as e:
         return f"Erreur création : {str(e)}"
 
-def update_calendar_event(summary_query: str, new_summary: str = None, new_start_time: str = None, new_end_time: str = None):
+def update_calendar_event(summary_query: str, new_summary: str = None, new_start_time: str = None, new_end_time: str = None, description: str = None):
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
         calendar = client_cal.calendar(url=RADICALE_URL)
         events = calendar.search(event=True)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        
         for e in events:
             comp = e.vobject_instance.vevent
+            # SÉCURITÉ : Ignorer les événements passés
+            event_end = comp.dtend.value
+            if isinstance(event_end, datetime.date) and not isinstance(event_end, datetime.datetime):
+                event_end = datetime.datetime.combine(event_end, datetime.time.max).replace(tzinfo=datetime.timezone.utc)
+            elif event_end.tzinfo is None:
+                event_end = event_end.replace(tzinfo=datetime.timezone.utc)
+            
+            if event_end < now:
+                continue
+
             if summary_query.lower() in str(comp.summary.value).lower():
                 if new_summary:
                     comp.summary.value = new_summary
                 if new_start_time:
-                    if len(new_start_time) == 10 and "T" not in new_start_time:
-                        comp.dtstart.value = datetime.date.fromisoformat(new_start_time)
-                    else:
-                        comp.dtstart.value = datetime.datetime.fromisoformat(new_start_time)
+                    comp.dtstart.value = datetime.datetime.fromisoformat(new_start_time)
                 if new_end_time:
-                    if len(new_end_time) == 10 and "T" not in new_end_time:
-                        comp.dtend.value = datetime.date.fromisoformat(new_end_time)
-                    else:
-                        comp.dtend.value = datetime.datetime.fromisoformat(new_end_time)
+                    comp.dtend.value = datetime.datetime.fromisoformat(new_end_time)
+                if description is not None:
+                    comp.description = description
                 e.save()
-                return f"Succès : séance '{summary_query}' mise à jour."
-        return f"Aucun événement correspondant à '{summary_query}'."
+                return f"Succès : séance futur '{summary_query}' mise à jour."
+        return f"Aucun événement futur correspondant à '{summary_query}'."
     except Exception as e:
         return f"Erreur mise à jour : {str(e)}"
 
-def delete_calendar_event(summary_query: str):
+def delete_calendar_event(summary_query: str = None, start_date: str = None, end_date: str = None):
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
         calendar = client_cal.calendar(url=RADICALE_URL)
-        events = calendar.search(event=True)
-        count = 0
-        for e in events:
-            comp = e.vobject_instance.vevent
-            if summary_query.lower() in str(comp.summary.value).lower():
-                e.delete()
-                count += 1
-        return f"Succès : {count} événement(s) supprimé(s)." if count > 0 else f"Aucun événement trouvé pour '{summary_query}'."
+        now = datetime.datetime.now(datetime.timezone.utc)
+        
+        # Mode Wipe : suppression sur une plage de dates (uniquement futur ou en cours)
+        if start_date and end_date:
+            dt_start = datetime.datetime.fromisoformat(start_date)
+            dt_end = datetime.datetime.fromisoformat(end_date)
+            events = calendar.search(start=dt_start, end=dt_end, event=True)
+            count = 0
+            for e in events:
+                comp = e.vobject_instance.vevent
+                event_end = comp.dtend.value
+                if isinstance(event_end, datetime.date) and not isinstance(event_end, datetime.datetime):
+                    event_end = datetime.datetime.combine(event_end, datetime.time.max).replace(tzinfo=datetime.timezone.utc)
+                elif event_end.tzinfo is None:
+                    event_end = event_end.replace(tzinfo=datetime.timezone.utc)
+                
+                # Interdiction formelle de supprimer le passé
+                if event_end >= now:
+                    e.delete()
+                    count += 1
+            return f"Succès : {count} événement(s) futur(s) supprimé(s) du {start_date} au {end_date}."
+            
+        # Mode recherche par titre (uniquement futur)
+        if summary_query:
+            events = calendar.search(event=True)
+            count = 0
+            for e in events:
+                comp = e.vobject_instance.vevent
+                event_end = comp.dtend.value
+                if isinstance(event_end, datetime.date) and not isinstance(event_end, datetime.datetime):
+                    event_end = datetime.datetime.combine(event_end, datetime.time.max).replace(tzinfo=datetime.timezone.utc)
+                elif event_end.tzinfo is None:
+                    event_end = event_end.replace(tzinfo=datetime.timezone.utc)
+                
+                if event_end < now:
+                    continue
+
+                if summary_query.lower() in str(comp.summary.value).lower():
+                    e.delete()
+                    count += 1
+            return f"Succès : {count} événement(s) futur(s) supprimé(s)." if count > 0 else f"Aucun événement futur trouvé pour '{summary_query}'."
+            
+        return "Précise summary_query ou une plage de dates (start_date, end_date)."
     except Exception as e:
         return f"Erreur suppression : {str(e)}"
 
@@ -269,51 +313,63 @@ def delete_calendar_event(summary_query: str):
 TOOLS = [
     {
         "name": "create_calendar_event",
-        "description": "Crée une séance ou un repos dans le calendrier Radicale. Pour une journée entière (ex: Repos), utilise strictement le format 'YYYY-MM-DD' pour start_time et end_time (ex: start='2026-11-23', end='2026-11-23'). Pour une séance avec horaire précis, utilise le format ISO datetime.",
+        "description": "Crée un événement ou un repos dans le calendrier Radicale (uniquement dans le futur). Pour les repos, règle l'horaire de 08:00:00 à 23:00:00 le jour même.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "summary": {"type": "string"},
-                "start_time": {"type": "string", "description": "Format 'YYYY-MM-DD' pour une journée entière ou ISO datetime."},
-                "end_time": {"type": "string", "description": "Format 'YYYY-MM-DD' pour une journée entière ou ISO datetime."}
+                "start_time": {"type": "string", "description": "Format ISO datetime futur."},
+                "end_time": {"type": "string", "description": "Format ISO datetime futur."},
+                "description": {"type": "string", "description": "Détails optionnels de la séance."}
             },
             "required": ["summary", "start_time", "end_time"]
         }
     },
     {
         "name": "update_calendar_event",
-        "description": "Modifie une séance dans l'agenda Radicale par recherche de titre.",
+        "description": "Modifie une séance dans l'agenda Radicale par recherche de titre (STRICTEMENT INTERdit de modifier le passé).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "summary_query": {"type": "string"},
                 "new_summary": {"type": "string"},
                 "new_start_time": {"type": "string"},
-                "new_end_time": {"type": "string"}
+                "new_end_time": {"type": "string"},
+                "description": {"type": "string"}
             },
             "required": ["summary_query"]
         }
     },
     {
         "name": "delete_calendar_event",
-        "description": "Supprime une séance du calendrier Radicale.",
+        "description": "Supprime ou wipe uniquement des événements futurs. Interdiction absolue de toucher au passé.",
         "input_schema": {
             "type": "object",
-            "properties": {"summary_query": {"type": "string"}},
-            "required": ["summary_query"]
+            "properties": {
+                "summary_query": {"type": "string"},
+                "start_date": {"type": "string"},
+                "end_date": {"type": "string"}
+            }
         }
     }
 ]
 
 SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
-Règles strictes :
+
+RÈGLES ABSOLUES DU CALENDRIER & DU TEMPS :
+1. PAS DE MODIFICATION DU PASSÉ : Tu ne dois JAMAIS modifier, éditer ou supprimer un événement passé. Toutes les modifications ou suppressions doivent porter exclusivement sur des événements futurs.
+2. PRÉSENTIEL AU BUREAU : Le lundi, le mercredi et le vendredi, l'utilisateur est sur site. Pas de grosse séance/fractionné lourd ces jours-là (privilégier du repos ou du footing très léger).
+3. SÉANCES DE REPOS : Planifie TOUJOURS les jours de repos de 08:00:00 à 23:00:00 le jour même pour éviter les bugs de chevauchement.
+4. DÉTAILS DES SÉANCES : Remplis la description avec du détail utile (allures, blocs d'échauffement, RPE).
+5. WIPE DE PLANNING : Pour refaire une semaine, purge uniquement les jours futurs concernés.
+
+FORMATAGE TELEGRAM STRICT :
 1. INTERDICTION FORMELLE D'UTILISER DES TABLEAUX (pas de caractère `|`). Utilise exclusivement des listes à puces (`-`).
 2. Utilise un Markdown simple et propre (gras avec `*`).
-3. Utilise des émojis pertinents et dynamiques (ex: ☀️, 🌧️, ❄️, 🏃‍♂️, 👟, ⚠️, 🏆, 🛌) pour la météo, le statut et les séances.
-4. Pour les jours de repos ou événements sur toute la journée, utilise TOUJOURS le format de date simple 'YYYY-MM-DD' (ex: start='2026-11-23', end='2026-11-23') afin qu'ils s'affichent proprement en journée entière dans le calendrier sans chevaucher les horaires.
-5. Dreeve est en lecture seule stricte : tu consultes la charge, l'historique et les records, mais tu n'écris jamais dedans. Tu gères l'écriture/modification/suppression uniquement dans l'agenda Radicale.
-6. Sois court, percutant et ne coupe jamais tes phrases.
+3. Utilise des émojis pertinents et dynamiques (☀️, 🌧️, ❄️, 🏃‍♂️, 👟, ⚠️, 🏆, 🛌).
+4. Dreeve est en lecture seule stricte.
+5. Sois court, percutant et ne coupe jamais tes phrases.
 """
 
 async def ask_claude_with_tools(user_prompt):
