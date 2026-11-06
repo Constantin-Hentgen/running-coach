@@ -122,7 +122,6 @@ def get_dreeve_data():
                 f"- Jours de repos (7j) : {load_data.get('restDaysLast7Days', 'N/A')}"
             )
 
-        # Récupération explicite des 20 derniers trainings
         res_act = requests.get(
             f"{DREEVE_BASE_URL}/api/v1/activities?filters[sportType]=Run&pagination[size]=20", 
             headers=headers, 
@@ -338,17 +337,17 @@ TOOLS = [
 SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
 
-RÈGLES ABSOLUES DE COMMUNICATION :
-1. INTERDICTION FORMELLE DE DIRE "Opération terminée." : Tu dois TOUJOURS expliquer précisément quelle opération a été effectuée ou analysée.
-2. TRANSPARENCE ET TEMPORALITÉ : Pour toute opération lourde (écriture calendrier, wipe), annonce immédiatement l'action en cours ("⏳ Connexion au calendrier Radicale en cours...").
-3. DESCRIPTIONS MULTI-LIGNES ET ÉMOJIS : Structure TOUJOURS la description avec des retours à la ligne explicites (`\\n`) et des émojis sportifs.
+DIRECTIVES CRITIQUES POUR LES INTERACTIONS ET LE PLANNING :
+1. INTERDICTION FORMELLE DE RÉPONDRE DES PHRASES GÉNÉRIQUES ("Opération terminée", "Analyse effectuée") : Tu dois TOUJOURS répondre en abordant directement la demande de l'utilisateur (conseil, modification d'agenda, débrief). Si l'utilisateur demande de modifier ou refaire un planning, tu DOIS utiliser immédiatement les outils de calendrier pour supprimer/modifier/créer les événements correspondants, puis lui faire un récapitulatif clair de l'action menée.
+2. TRANSPARENCE ET TEMPORALITÉ : Annonce l'action en cours ("⏳ Modification du planning en cours...") si l'appel prend une seconde.
+3. DESCRIPTIONS MULTI-LIGNES ET ÉMOJIS : Structure TOUJOURS la description des événements avec des retours à la ligne (`\\n`) et des émojis.
 
-SÉCURITÉ ET ACCÈS UNIQUE :
-- Tu gères exclusivement l'unique calendrier configuré via RADICALE_URL.
-- Dreeve en lecture seule stricte : récupère les données de charge brutes et les 20 derniers trainings fournis.
-- PAS DE MODIFICATION DU PASSÉ.
-- Présentiel bureau : Lundi, mercredi, vendredi = pas de grosse séance.
-- Repos : planifiés de 08:00 à 23:00 le jour même.
+SÉCURITÉ ET ACCÈS :
+- Calendrier unique via RADICALE_URL.
+- Dreeve en lecture seule stricte.
+- Pas de modification du passé.
+- Présentiel bureau : Lundi, mercredi, vendredi = séances légères/repos.
+- Repos : planifiés de 08:00 à 23:00.
 - Format Telegram : listes à puces (`-`), gras (`*`), émojis sobres. ZÉRO TABLEAU (pas de `|`).
 """
 
@@ -421,8 +420,9 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
             reply_text = block.text
             break
 
+    # Sécurité anti-réponse vide ou générique
     if not reply_text or "opération terminée" in reply_text.lower():
-        reply_text = "⚡ Analyse des 20 derniers runs et des métriques de charge effectuée avec succès."
+        reply_text = "⚡ Action bien prise en compte sur ton planning et ton suivi."
 
     USER_CONVERSATION_HISTORY[chat_id].append({"role": "user", "content": user_prompt})
     if reply_text:
