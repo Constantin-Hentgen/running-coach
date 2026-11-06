@@ -45,7 +45,6 @@ telegram_app = None
 def verify_services_connectivity():
     logger.info("=== LANCE LE TEST DE CONNECTIVITÉ DES SERVICES ===")
     
-    # Audit de la clé Dreeve
     if not DREEVE_API_KEY:
         logger.error("[DREEVE] DREEVE_API_KEY est VIDE ou non définie !")
     else:
@@ -113,9 +112,6 @@ def get_weather_forecast():
         return {}
 
 def get_dreeve_data():
-    """
-    Interroge l'API REST officielle de Dreeve pour la charge (CTL/ATL) et les activités récentes.
-    """
     if not DREEVE_API_KEY:
         return "Clé Dreeve non configurée."
 
@@ -132,25 +128,42 @@ def get_dreeve_data():
         if res_load.status_code == 200:
             load_data = res_load.json()
             output_parts.append(
+                f"📊 *Charge actuelle :*\n"
                 f"- CTL (Forme) : {load_data.get('ctl', 'N/A')}\n"
                 f"- ATL (Fatigue) : {load_data.get('atl', 'N/A')}\n"
                 f"- TSB (Fraîcheur) : {load_data.get('tsb', {}).get('value', 'N/A')} ({load_data.get('tsb', {}).get('status', '')})"
             )
 
-        # 2. Activités récentes
-        res_act = requests.get(f"{DREEVE_BASE_URL}/api/v1/activities?pagination[size]=3", headers=headers, timeout=8)
+        # 2. Récupération des courses à pied
+        res_act = requests.get(
+            f"{DREEVE_BASE_URL}/api/v1/activities?filters[sportType]=Run&pagination[size]=100", 
+            headers=headers, 
+            timeout=8
+        )
+        
         if res_act.status_code == 200:
             data = res_act.json()
             activities = data.get("activities", [])
-            summary_list = []
-            for act in activities:
-                name = act.get("name", "Sortie")
-                date = act.get("startDateLocal", "Date inconnue")
-                summary_list.append(f"- {date} : {name}")
-            if summary_list:
-                output_parts.append("Dernières activités :\n" + "\n".join(summary_list))
+            
+            if activities:
+                longest_run = max(activities, key=lambda x: x.get("distance", 0), default=None)
+                
+                summary_list = []
+                for act in activities[:3]:
+                    name = act.get("name", "Sortie")
+                    date = act.get("startDateLocal", "Date inconnue")[:10]
+                    dist = act.get("distance", 0) / 1000
+                    summary_list.append(f"- {date} : {name} ({dist:.2f} km)")
+                
+                output_parts.append("🏃 *Dernières courses :*\n" + "\n".join(summary_list))
+                
+                if longest_run and longest_run.get("distance", 0) > 0:
+                    l_dist = longest_run.get("distance", 0) / 1000
+                    l_date = longest_run.get("startDateLocal", "")[:10]
+                    l_name = longest_run.get("name", "Course")
+                    output_parts.append(f"🏆 *Record de distance (Run le plus long) :* {l_dist:.2f} km le {l_date} ('{l_name}')")
 
-        return "\n".join(output_parts) if output_parts else "Aucune donnée Dreeve disponible."
+        return "\n\n".join(output_parts) if output_parts else "Aucuna donnée Dreeve disponible."
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des données Dreeve : {e}")
         return f"Erreur requête API Dreeve : {str(e)}"
@@ -191,9 +204,19 @@ def create_calendar_event(summary: str, start_time: str, end_time: str):
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
         calendar = client_cal.calendar(url=RADICALE_URL)
-        dt_start = datetime.datetime.fromisoformat(start_time)
-        dt_end = datetime.datetime.fromisoformat(end_time)
-        calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary)
+        
+        # Gestion intelligente : si les formats sont YYYY-MM-DD, on crée un événement de journée entière (All-day)
+        if len(start_time) == 10 and len(end_time) == 10 and "T" not in start_time:
+            dt_start = datetime.date.fromisoformat(start_time)
+            dt_end = datetime.date.fromisoformat(end_time)
+            if dt_end <= dt_start:
+                dt_end = dt_start + datetime.timedelta(days=1)
+            calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary)
+        else:
+            dt_start = datetime.datetime.fromisoformat(start_time)
+            dt_end = datetime.datetime.fromisoformat(end_time)
+            calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary)
+            
         return f"Succès : séance '{summary}' créée."
     except Exception as e:
         return f"Erreur création : {str(e)}"
@@ -209,9 +232,15 @@ def update_calendar_event(summary_query: str, new_summary: str = None, new_start
                 if new_summary:
                     comp.summary.value = new_summary
                 if new_start_time:
-                    comp.dtstart.value = datetime.datetime.fromisoformat(new_start_time)
+                    if len(new_start_time) == 10 and "T" not in new_start_time:
+                        comp.dtstart.value = datetime.date.fromisoformat(new_start_time)
+                    else:
+                        comp.dtstart.value = datetime.datetime.fromisoformat(new_start_time)
                 if new_end_time:
-                    comp.dtend.value = datetime.datetime.fromisoformat(new_end_time)
+                    if len(new_end_time) == 10 and "T" not in new_end_time:
+                        comp.dtend.value = datetime.date.fromisoformat(new_end_time)
+                    else:
+                        comp.dtend.value = datetime.datetime.fromisoformat(new_end_time)
                 e.save()
                 return f"Succès : séance '{summary_query}' mise à jour."
         return f"Aucun événement correspondant à '{summary_query}'."
@@ -240,13 +269,13 @@ def delete_calendar_event(summary_query: str):
 TOOLS = [
     {
         "name": "create_calendar_event",
-        "description": "Crée une séance de course dans le calendrier Radicale principal.",
+        "description": "Crée une séance ou un repos dans le calendrier Radicale. Pour une journée entière (ex: Repos), utilise strictement le format 'YYYY-MM-DD' pour start_time et end_time (ex: start='2026-11-23', end='2026-11-23'). Pour une séance avec horaire précis, utilise le format ISO datetime.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "summary": {"type": "string"},
-                "start_time": {"type": "string"},
-                "end_time": {"type": "string"}
+                "start_time": {"type": "string", "description": "Format 'YYYY-MM-DD' pour une journée entière ou ISO datetime."},
+                "end_time": {"type": "string", "description": "Format 'YYYY-MM-DD' pour une journée entière ou ISO datetime."}
             },
             "required": ["summary", "start_time", "end_time"]
         }
@@ -281,8 +310,10 @@ Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
 Règles strictes :
 1. INTERDICTION FORMELLE D'UTILISER DES TABLEAUX (pas de caractère `|`). Utilise exclusivement des listes à puces (`-`).
 2. Utilise un Markdown simple et propre (gras avec `*`).
-3. Dreeve est en lecture seule stricte : tu consultes la charge (CTL/ATL/TSB) et les activités remontées, mais tu n'écris jamais dedans. Tu gères l'écriture/modification/suppression uniquement dans l'agenda Radicale.
-4. Sois court, percutant et ne coupe jamais tes phrases.
+3. Utilise des émojis pertinents et dynamiques (ex: ☀️, 🌧️, ❄️, 🏃‍♂️, 👟, ⚠️, 🏆, 🛌) pour la météo, le statut et les séances.
+4. Pour les jours de repos ou événements sur toute la journée, utilise TOUJOURS le format de date simple 'YYYY-MM-DD' (ex: start='2026-11-23', end='2026-11-23') afin qu'ils s'affichent proprement en journée entière dans le calendrier sans chevaucher les horaires.
+5. Dreeve est en lecture seule stricte : tu consultes la charge, l'historique et les records, mais tu n'écris jamais dedans. Tu gères l'écriture/modification/suppression uniquement dans l'agenda Radicale.
+6. Sois court, percutant et ne coupe jamais tes phrases.
 """
 
 async def ask_claude_with_tools(user_prompt):
@@ -377,7 +408,6 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
 async def startup_event():
     global telegram_app
     
-    # Exécution du test de connectivité logué au démarrage
     verify_services_connectivity()
 
     if TELEGRAM_BOT_TOKEN:
