@@ -3,45 +3,42 @@ import requests
 import datetime
 import caldav
 import anthropic
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 app = FastAPI()
 
-# Configuration depuis les variables d'environnement
+# Configuration via variables d'environnement
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-RADICALE_URL = os.getenv("RADICALE_URL")  # ex: http://radicale:5232/user/running/
+RADICALE_URL = os.getenv("RADICALE_URL")  # ex: http://radicale:5232/constantin/24612253-54d0-6121-fbf.../
 RADICALE_USER = os.getenv("RADICALE_USER")
 RADICALE_PASS = os.getenv("RADICALE_PASS")
 DREEVE_MCP_KEY = os.getenv("DREEVE_MCP_KEY")
-DREEVE_API_URL = os.getenv("DREEVE_API_URL", "https://sport.hentgen.ovh/api/v1")
+DREEVE_MCP_URL = os.getenv("DREEVE_MCP_URL", "https://sport.hentgen.ovh/mcp")
 CITY_LAT_LON = (48.8566, 2.3522)  # Vos coordonnées (ex: Paris)
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ------------------------------------------------------------------
-# OUTILS DE RÉCUPÉRATION DE DONNÉES
+# OUTILS ET INTÉGRATIONS (CalDAV, Dreeve MCP, Météo)
 # ------------------------------------------------------------------
 
 def get_weather_forecast():
-    """Récupère la météo et les précipitations pour les 7 prochains jours (Open-Meteo)."""
+    """Récupère la météo et les précipitations pour les 7 prochains jours."""
     lat, lon = CITY_LAT_LON
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max&timezone=auto"
     res = requests.get(url).json()
     return res.get("daily", {})
 
 def get_calendar_events(days_ahead=7):
-    """Lit les événements du calendrier dédié running sur Radicale."""
+    """Lit les événements du calendrier dédié running sur Radicale via son UUID."""
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
-        principal = client_cal.principal()
-        calendars = principal.calendars()
-        if not calendars:
-            return "Aucun calendrier trouvé sur Radicale."
+        # En pointant directement sur l'URL de la collection/UUID, on cible le calendrier exact
+        calendar = client_cal.calendar(url=RADICALE_URL)
         
-        calendar = calendars[0]
         now = datetime.datetime.now(datetime.timezone.utc)
         end = now + datetime.timedelta(days=days_ahead)
         
@@ -58,19 +55,20 @@ def get_calendar_events(days_ahead=7):
     except Exception as e:
         return f"Erreur de lecture Radicale: {str(e)}"
 
-def get_dreeve_activities():
-    """Récupère les dernières activités sportives via l'API Dreeve."""
+def get_dreeve_data():
+    """Interroge le serveur MCP Dreeve pour récupérer les activités et métriques."""
     try:
         headers = {"Authorization": f"Bearer {DREEVE_MCP_KEY}"}
-        res = requests.get(f"{DREEVE_API_URL}/activities", headers=headers)
+        # Dreeve expose son serveur MCP compatible HTTP sur /mcp
+        res = requests.get(DREEVE_MCP_URL, headers=headers)
         if res.status_code == 200:
-            return res.json()[:3]  # Les 3 dernières activités
-        return f"Erreur Dreeve (Code {res.status_code})"
+            return res.json()
+        return f"Statut MCP Dreeve (Code {res.status_code})"
     except Exception as e:
-        return f"Erreur de connexion Dreeve: {str(e)}"
+        return f"Erreur de connexion Dreeve MCP: {str(e)}"
 
 # ------------------------------------------------------------------
-# SYSTEM PROMPT DU COACH
+# PROMPT DU COACH
 # ------------------------------------------------------------------
 
 SYSTEM_PROMPT = """
@@ -90,7 +88,7 @@ Analyse les requêtes de l'utilisateur, croise les données météo, l'agenda et
 """
 
 # ------------------------------------------------------------------
-# GESTION DU BOT TELEGRAM (Mode Pooling pour simplifier)
+# BOT TELEGRAM & FASTAPI
 # ------------------------------------------------------------------
 
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -98,23 +96,22 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     if not user_text:
         return
     
-    # Collecte des données contextuelles en direct
     weather_data = get_weather_forecast()
     calendar_data = get_calendar_events()
-    dreeve_data = get_dreeve_activities()
+    dreeve_data = get_dreeve_data()
     
     prompt_with_context = f"""
 Message de l'utilisateur : "{user_text}"
 
 Contexte actuel :
 - Météo (7 prochains jours) : {weather_data}
-- Agenda Radicale (Running) : {calendar_data}
-- Dernières activités Dreeve : {dreeve_data}
+- Agenda Radicale (Running UUID) : {calendar_data}
+- Données Dreeve (MCP) : {dreeve_data}
 """
 
-    # Appel à Claude 3.5 Haiku
+    # Utilisation du modèle demandé par l'utilisateur
     response = anthropic_client.messages.create(
-        model="claude-3-5-haiku-20241022",
+        model="claude-haiku-5-5",
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=[
@@ -125,7 +122,6 @@ Contexte actuel :
     reply_text = response.content[0].text
     await update.message.reply_text(reply_text)
 
-# Initialisation du bot Telegram au démarrage de l'app FastAPI
 telegram_app = None
 
 @app.on_event("startup")
@@ -136,9 +132,8 @@ async def startup_event():
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
         await telegram_app.initialize()
         await telegram_app.start()
-        # Lancement du polling en arrière-plan
         await telegram_app.updater.start_polling()
-        print("Bot Telegram démarré en arrière-plan sur FastAPI.")
+        print("Bot Telegram démarré en arrière-plan avec uv.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -149,4 +144,4 @@ async def shutdown_event():
 
 @app.get("/health")
 def health_check():
-    return {"status": "running", "service": "running-coach-autonomous-agent"}
+    return {"status": "running", "engine": "uv"}
