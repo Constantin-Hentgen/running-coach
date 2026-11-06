@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  running-coach:
+    build: .
+    container_name: running_coach_agent
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=sk-ant-votre-cle
+      - TELEGRAM_BOT_TOKEN=votre_token_telegram
+      - RADICALE_URL=http://<ip_ou_localhost_radicale>:5232/user/running/
+      - RADICALE_USER=votre_user
+      - RADICALE_PASS=votre_password
+      - DREEVE_MCP_KEY=votre_cle_mcp_dreeve
+      - DREEVE_API_URL=https://sport.hentgen.ovh/api/v1
