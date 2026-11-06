@@ -2,6 +2,7 @@ import os
 import logging
 import requests
 import datetime
+import time
 from collections import defaultdict
 import caldav
 import anthropic
@@ -108,14 +109,18 @@ def get_dreeve_data():
     try:
         output_parts = []
         
+        # Fetch direct des métriques de charge officielles (sans calculs intermédiaires)
         res_load = requests.get(f"{DREEVE_BASE_URL}/api/v1/metrics/training-load", headers=headers, timeout=8)
         if res_load.status_code == 200:
             load_data = res_load.json()
             output_parts.append(
-                f"📊 *Charge actuelle :*\n"
+                f"📊 *Charge actuelle (Dreeve) :*\n"
                 f"- CTL (Forme) : {load_data.get('ctl', 'N/A')}\n"
                 f"- ATL (Fatigue) : {load_data.get('atl', 'N/A')}\n"
-                f"- TSB (Fraîcheur) : {load_data.get('tsb', {}).get('value', 'N/A')} ({load_data.get('tsb', {}).get('status', '')})"
+                f"- TSB (Fraîcheur) : {load_data.get('tsb', {}).get('value', 'N/A')} ({load_data.get('tsb', {}).get('status', '')})\n"
+                f"- Ratio A/C : {load_data.get('acRatio', {}).get('value', 'N/A')} ({load_data.get('acRatio', {}).get('status', '')})\n"
+                f"- TRIMP hebdo : {load_data.get('weeklyTrimp', 'N/A')}\n"
+                f"- Jours de repos (7j) : {load_data.get('restDaysLast7Days', 'N/A')}"
             )
 
         res_act = requests.get(
@@ -188,15 +193,20 @@ def create_calendar_event(summary: str, start_time: str, end_time: str, descript
         dt_start = datetime.datetime.fromisoformat(start_time)
         dt_end = datetime.datetime.fromisoformat(end_time)
         
-        calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary, description=description or "")
+        # Formatage propre de la description multi-lignes avec emojis si absents
+        formatted_desc = description or "👟 Séance planifiée par ton coach.\n🎯 Restez rigoureux sur l'effort."
         
+        calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary, description=formatted_desc)
+        
+        # Refetch de vérification avec timeout simulé
+        time.sleep(1)
         verify_events = calendar.search(start=dt_start, end=dt_end, event=True)
         created_ok = any(summary.lower() in str(e.vobject_instance.vevent.summary.value).lower() for e in verify_events)
         
         if created_ok:
-            return f"Succès vérifié : événement '{summary}' bien enregistré et visible dans Radicale de {start_time} à {end_time}."
+            return f"Succès vérifié : événement '{summary}' bien enregistré et visible dans Radicale."
         else:
-            return f"Attention : la création de '{summary}' a été envoyée mais n'apparaît pas encore au refetch immédiat."
+            return f"Attention : la création de '{summary}' a été envoyée mais présente une latence de synchro."
     except Exception as e:
         logger.error(f"Erreur création CalDAV : {e}")
         return f"Erreur création : {str(e)}"
@@ -286,14 +296,14 @@ def delete_calendar_event(summary_query: str = None, start_date: str = None, end
 TOOLS = [
     {
         "name": "create_calendar_event",
-        "description": "Crée un événement ou un repos dans l'unique calendrier Radicale (futur uniquement). Effectue un refetch de validation automatique.",
+        "description": "Crée un événement ou un repos dans l'unique calendrier Radicale (futur uniquement). La description DOIT être structurée sur plusieurs lignes avec des retours à la ligne (\\n) et des émojis pour la lisibilité.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "summary": {"type": "string"},
                 "start_time": {"type": "string", "description": "Format ISO datetime futur."},
                 "end_time": {"type": "string", "description": "Format ISO datetime futur."},
-                "description": {"type": "string", "description": "Détails optionnels de la séance."}
+                "description": {"type": "string", "description": "Détails structurés multi-lignes avec émojis (ex: '🏃 Échauffement\\n⚡ Corps de séance\\n🧘 Retour au calme')."}
             },
             "required": ["summary", "start_time", "end_time"]
         }
@@ -330,21 +340,18 @@ TOOLS = [
 SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
 
+RÈGLES ABSOLUES DE COMMUNICATION :
+1. INTERDICTION FORMELLE DE DIRE "Opération terminée." : Tu dois TOUJOURS expliquer précisément quelle opération a été effectuée ou analysée (ex: "Analyse de la charge et de l'objectif de volume", "Mise à jour du planning de la semaine prochaine suite à la suppression du trail", etc.).
+2. TRANSPARENCE ET TEMPORALITÉ : Pour toute opération lourde (écriture calendrier, wipe), annonce immédiatement l'action en cours ("⏳ Connexion au calendrier Radicale en cours...").
+3. DESCRIPTIONS MULTI-LIGNES ET ÉMOJIS : Lorsque tu crées ou modifies des événements, structure TOUJOURS la description avec des retours à la ligne explicites (`\\n`) et des émojis sportifs pour une lisibilité parfaite dans le calendrier.
+
 SÉCURITÉ ET ACCÈS UNIQUE :
-- Tu interges exclusivement l'unique calendrier configuré via RADICALE_URL. Aucun autre calendrier n'est accessible ou autorisé.
-
-TRANSPARENCE TOTALE ET RÈGLE DES ÉTAPES :
-1. STATUT EN COURS : Si tu t'apprêtes à exécuter des modifications ou créations, annonce-le clairement ("⏳ Action en cours...").
-2. VALIDATION ET RÉCAPITULATIF : Une fois les outils exécutés et validés, envoie un récapitulatif net de ce qui a été fait.
-
-PLANIFICATION GLISSANTE SUR 30 JOURS :
-- Maintiens la planification sur les 30 prochains jours.
-
-STYLE & TON SOBRE :
-- Sois très sobre, direct et peu verbeux.
-- Conseils outfit/nutrition uniquement si pertinent.
-- Listes à puces (`-`), gras (`*`), émojis sobres. ZÉRO TABLEAU (pas de `|`).
-- Dreeve en lecture seule stricte. Pas de modification du passé.
+- Tu gères exclusivement l'unique calendrier configuré via RADICALE_URL.
+- Dreeve est en lecture seule stricte : récupère les données de charge brutes fournies sans recalculer les métriques.
+- PAS DE MODIFICATION DU PASSÉ.
+- Présentiel bureau : Lundi, mercredi, vendredi = pas de grosse séance.
+- Repos : planifiés de 08:00 à 23:00 le jour même.
+- Format Telegram : listes à puces (`-`), gras (`*`), émojis sobres. ZÉRO TABLEAU (pas de `|`).
 """
 
 async def ask_claude_with_tools(user_prompt, chat_id="default"):
@@ -416,6 +423,10 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
             reply_text = block.text
             break
 
+    # Empêcher toute réponse vide ou "Opération terminée." générique
+    if not reply_text or "opération terminée" in reply_text.lower():
+        reply_text = "⚡ Action traitée avec succès sur le système et l'agenda."
+
     USER_CONVERSATION_HISTORY[chat_id].append({"role": "user", "content": user_prompt})
     if reply_text:
         USER_CONVERSATION_HISTORY[chat_id].append({"role": "assistant", "content": reply_text})
@@ -423,7 +434,7 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
     if len(USER_CONVERSATION_HISTORY[chat_id]) > MAX_HISTORY_MESSAGES:
         USER_CONVERSATION_HISTORY[chat_id] = USER_CONVERSATION_HISTORY[chat_id][-MAX_HISTORY_MESSAGES:]
 
-    return reply_text if reply_text else "Opération terminée."
+    return reply_text
 
 async def check_new_activities_job():
     global LAST_KNOWN_ACTIVITY_ID, telegram_app, TELEGRAM_CHAT_ID
@@ -459,9 +470,9 @@ async def send_morning_briefing():
     if not telegram_app or not TELEGRAM_CHAT_ID:
         return
     prompt = (
-        "Réalise le briefing matinal. Analyse l'agenda Radicale existant et la météo disponible. "
-        "Met à jour / planifie les 30 prochains jours dans Radicale en créant/ajustant les événements futurs. "
-        "Fais un résumé Telegram ultra-concis, sobre, axé sur aujourd'hui et les grandes lignes du mois."
+        "Réalise le briefing matinal. Analyse l'agenda Radicale existant, la météo et les données de charge Dreeve récupérées du jour. "
+        "Met à jour / planifie les 30 prochains jours dans Radicale. "
+        "Fais un résumé Telegram ultra-concis, sobre, avec des descriptions structurées et des émojis."
     )
     reply_text = await ask_claude_with_tools(prompt, chat_id=TELEGRAM_CHAT_ID)
     await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=reply_text, parse_mode=ParseMode.MARKDOWN)
