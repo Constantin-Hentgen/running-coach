@@ -10,9 +10,6 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from mcp import ClientSession
-from mcp.client.sse import sse_client
-
 app = FastAPI()
 
 # Configuration
@@ -46,34 +43,59 @@ def get_weather_forecast():
         print(f"[ERROR] Météo: {e}")
         return {}
 
-async def get_dreeve_data():
+def get_dreeve_data():
     """
-    Connexion asynchrone native au serveur MCP Dreeve via SSE client.
+    Communique avec le serveur MCP Dreeve via une séquence JSON-RPC en POST 
+    (puisque le GET/SSE est rejeté par un 405).
     """
     if not DREEVE_MCP_URL or not DREEVE_MCP_KEY:
-        print("[WARN] Dreeve MCP non configuré.")
         return "Dreeve non configuré."
 
-    headers = {"Authorization": f"Bearer {DREEVE_MCP_KEY}"}
+    headers = {
+        "Authorization": f"Bearer {DREEVE_MCP_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
 
     try:
-        print(f"[DEBUG] Tentative de connexion MCP à {DREEVE_MCP_URL}...")
-        async with sse_client(DREEVE_MCP_URL, headers=headers) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                resources = await session.list_resources()
-                if resources.resources:
-                    res_content = await session.read_resource(resources.resources[0].uri)
-                    print("[DEBUG] Données MCP Dreeve récupérées avec succès.")
-                    return f"Données Dreeve (MCP) : {res_content}"
-                
-                tools = await session.list_tools()
-                print("[DEBUG] Outils MCP Dreeve récupérés avec succès.")
-                return f"Outils Dreeve disponibles : {[t.name for t in tools.tools]}"
+        session = requests.Session()
+        session.headers.update(headers)
+
+        # 1. Handshake d'initialisation MCP (JSON-RPC)
+        init_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "running-coach", "version": "1.0"}
+            }
+        }
+        res_init = session.post(DREEVE_MCP_URL, json=init_payload, timeout=5)
+        if res_init.status_code != 200:
+            return f"Dreeve MCP refus init (HTTP {res_init.status_code})"
+
+        # 2. Notification de fin d'initialisation
+        session.post(DREEVE_MCP_URL, json={
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }, timeout=3)
+
+        # 3. Récupération des outils / données disponibles
+        tools_payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }
+        res_tools = session.post(DREEVE_MCP_URL, json=tools_payload, timeout=5)
+        if res_tools.status_code == 200:
+            return f"Données Dreeve (MCP) : {res_tools.text[:1500]}"
+
+        return f"Dreeve MCP connecté mais échec lecture (HTTP {res_tools.status_code})"
     except Exception as e:
-        print(f"[ERROR] Échec connexion Dreeve MCP: {e}")
-        traceback.print_exc()
-        return f"Dreeve MCP injoignable ({str(e)})"
+        return f"Erreur de connexion Dreeve MCP : {str(e)}"
 
 def fetch_events_from_calendar(client_cal, url, days_ahead):
     try:
