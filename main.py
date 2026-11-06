@@ -45,8 +45,7 @@ def get_weather_forecast():
 
 def get_dreeve_data():
     """
-    Communique avec le serveur MCP Dreeve via une séquence JSON-RPC en POST 
-    (puisque le GET/SSE est rejeté par un 405).
+    Communique avec le serveur MCP Dreeve via une séquence JSON-RPC en POST.
     """
     if not DREEVE_MCP_URL or not DREEVE_MCP_KEY:
         return "Dreeve non configuré."
@@ -229,7 +228,7 @@ Règles strictes de formatage pour Telegram :
 async def ask_claude_with_tools(user_prompt):
     weather_data = get_weather_forecast()
     calendar_data = get_all_calendar_events()
-    dreeve_data = await get_dreeve_data()
+    dreeve_data = get_dreeve_data()  # <-- Appel synchrone sans 'await'
     
     full_prompt = f"""
 Message de l'utilisateur : "{user_prompt}"
