@@ -1,6 +1,7 @@
 import os
 import requests
 import datetime
+import traceback
 import caldav
 import anthropic
 from fastapi import FastAPI
@@ -8,6 +9,9 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.background import BackgroundScheduler
+
+from mcp import ClientSession
+from mcp.client.sse import sse_client
 
 app = FastAPI()
 
@@ -38,50 +42,37 @@ def get_weather_forecast():
         if res.status_code == 200:
             return res.json().get("daily", {})
         return {}
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] Météo: {e}")
         return {}
 
-import asyncio
-from mcp import ClientSession
-from mcp.client.sse import sse_client
-
-def get_dreeve_data():
+async def get_dreeve_data():
     """
-    Connecte le client MCP officiel au serveur Dreeve via SSE avec le Bearer token.
+    Connexion asynchrone native au serveur MCP Dreeve via SSE client.
     """
     if not DREEVE_MCP_URL or not DREEVE_MCP_KEY:
+        print("[WARN] Dreeve MCP non configuré.")
         return "Dreeve non configuré."
 
     headers = {"Authorization": f"Bearer {DREEVE_MCP_KEY}"}
 
-    async def _fetch():
-        try:
-            async with sse_client(DREEVE_MCP_URL, headers=headers) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    
-                    # Récupération des ressources exposées par Dreeve (CTL, ATL, activités...)
-                    resources = await session.list_resources()
-                    
-                    # Si des ressources existent, on lit la première ou le résumé
-                    if resources.resources:
-                        res_content = await session.read_resource(resources.resources[0].uri)
-                        return f"Données Dreeve (MCP) : {res_content}"
-                    
-                    # Alternative : lister les outils si Dreeve expose des tools MCP
-                    tools = await session.list_tools()
-                    return f"Outils Dreeve disponibles via MCP : {[t.name for t in tools.tools]}"
-        except Exception as e:
-            return f"Erreur MCP Dreeve : {str(e)}"
-
-    # Exécution de la coroutine async depuis notre fonction synchrone
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            return asyncio.run_coroutine_threadsafe(_fetch(), loop).result(timeout=10)
-        else:
-            return loop.run_until_complete(_fetch())
+        print(f"[DEBUG] Tentative de connexion MCP à {DREEVE_MCP_URL}...")
+        async with sse_client(DREEVE_MCP_URL, headers=headers) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                resources = await session.list_resources()
+                if resources.resources:
+                    res_content = await session.read_resource(resources.resources[0].uri)
+                    print("[DEBUG] Données MCP Dreeve récupérées avec succès.")
+                    return f"Données Dreeve (MCP) : {res_content}"
+                
+                tools = await session.list_tools()
+                print("[DEBUG] Outils MCP Dreeve récupérés avec succès.")
+                return f"Outils Dreeve disponibles : {[t.name for t in tools.tools]}"
     except Exception as e:
+        print(f"[ERROR] Échec connexion Dreeve MCP: {e}")
+        traceback.print_exc()
         return f"Dreeve MCP injoignable ({str(e)})"
 
 def fetch_events_from_calendar(client_cal, url, days_ahead):
@@ -213,10 +204,10 @@ Règles strictes de formatage pour Telegram :
 3. Sois court, percutant et ne coupe jamais tes phrases.
 """
 
-def ask_claude_with_tools(user_prompt):
+async def ask_claude_with_tools(user_prompt):
     weather_data = get_weather_forecast()
     calendar_data = get_all_calendar_events()
-    dreeve_data = get_dreeve_data()
+    dreeve_data = await get_dreeve_data()
     
     full_prompt = f"""
 Message de l'utilisateur : "{user_prompt}"
@@ -229,7 +220,6 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
 
     messages = [{"role": "user", "content": full_prompt}]
     
-    # max_tokens augmenté à 2048 pour éviter les troncatures
     response = anthropic_client.messages.create(
         model="claude-haiku-5-5",
         max_tokens=2048,
@@ -287,7 +277,7 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
 async def send_morning_briefing():
     if not telegram_app or not TELEGRAM_CHAT_ID:
         return
-    reply_text = ask_claude_with_tools("Fais un briefing matinal ultra-concis pour aujourd'hui.")
+    reply_text = await ask_claude_with_tools("Fais un briefing matinal ultra-concis pour aujourd'hui.")
     await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=reply_text, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -295,7 +285,7 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     if not user_text:
         return
     
-    reply_text = ask_claude_with_tools(user_text)
+    reply_text = await ask_claude_with_tools(user_text)
 
     try:
         await update.message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
