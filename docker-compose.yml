@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   running-coach:
     build: .
@@ -8,11 +6,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - ANTHROPIC_API_KEY=sk-ant-votre-cle
-      - TELEGRAM_BOT_TOKEN=votre_token_telegram
-      # URL exacte pointant directement vers ton calendrier Running UUID
-      - RADICALE_URL=http://radicale:5232/constantin/24612253-54d0-6121-fbf.../
-      - RADICALE_USER=constantin
-      - RADICALE_PASS=ton_mot_de_passe
-      - DREEVE_MCP_KEY=drvm_...
-      - DREEVE_MCP_URL=https://sport.hentgen.ovh/mcp
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - RADICALE_URL=${RADICALE_URL}
+      - RADICALE_USER=${RADICALE_USER}
+      - RADICALE_PASS=${RADICALE_PASS}
+      - DREEVE_MCP_KEY=${DREEVE_MCP_KEY}
+      - DREEVE_MCP_URL=${DREEVE_MCP_URL}
