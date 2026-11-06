@@ -21,23 +21,70 @@ RADICALE_USER = os.getenv("RADICALE_USER")
 RADICALE_PASS = os.getenv("RADICALE_PASS")
 DREEVE_MCP_KEY = os.getenv("DREEVE_MCP_KEY")
 DREEVE_MCP_URL = os.getenv("DREEVE_MCP_URL", "https://sport.hentgen.ovh/mcp")
-CITY_LAT_LON = (48.8566, 2.3522)
+DREEVE_API_URL = os.getenv("DREEVE_API_URL", "https://sport.hentgen.ovh/api/v1")
+CITY_LAT_LON = (48.8566, 2.3522)  # Coordonnées (ex: Paris)
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 telegram_app = None
 
 # ------------------------------------------------------------------
-# OUTILS CALDAV (Lecture, Création, Modification, Suppression)
+# OUTILS (Météo, Dreeve, Radicale)
 # ------------------------------------------------------------------
 
 def get_weather_forecast():
+    """Récupère la météo Open-Meteo avec retry et timeout étendu."""
     try:
         lat, lon = CITY_LAT_LON
         url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max&timezone=auto"
-        res = requests.get(url, timeout=5).json()
-        return res.get("daily", {})
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            return res.json().get("daily", {})
+        return f"Avertissement Météo : Code HTTP {res.status_code}"
     except Exception as e:
-        return f"Erreur météo: {str(e)}"
+        return f"Erreur de connexion Météo : {str(e)}"
+
+def get_dreeve_data():
+    """
+    Récupère les données Dreeve. 
+    Tente l'API REST ou l'endpoint MCP avec le header de Bearer Token drvm_...
+    """
+    if not DREEVE_MCP_KEY:
+        return "Clé DREEVE_MCP_KEY non configurée."
+        
+    headers = {
+        "Authorization": f"Bearer {DREEVE_MCP_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    # 1. Tentative via API REST Dreeve (statistiques / dernières activités)
+    try:
+        api_res = requests.get(f"{DREEVE_API_URL}/activities", headers=headers, timeout=5)
+        if api_res.status_code == 200:
+            return api_res.text[:2000]
+    except Exception:
+        pass
+
+    # 2. Fallback / Requete directe vers /mcp
+    try:
+        res = requests.get(DREEVE_MCP_URL, headers=headers, timeout=8)
+        if res.status_code == 200:
+            return res.text[:2000]
+        elif res.status_code == 405:
+            # Si le serveur MCP exige un POST JSON-RPC pour initialiser la connexion
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            }
+            post_res = requests.post(DREEVE_MCP_URL, headers=headers, json=payload, timeout=8)
+            if post_res.status_code == 200:
+                return f"Outils Dreeve MCP disponibles : {post_res.text[:1500]}"
+            return f"Serveur MCP Dreeve accessible mais nécessite un payload JSON-RPC (HTTP {post_res.status_code})."
+        return f"Statut Dreeve MCP : HTTP {res.status_code}"
+    except Exception as e:
+        return f"Erreur de connexion Dreeve MCP : {str(e)}"
 
 def fetch_events_from_calendar(client_cal, url, days_ahead):
     try:
@@ -49,7 +96,6 @@ def fetch_events_from_calendar(client_cal, url, days_ahead):
         for e in events:
             component = e.vobject_instance.vevent
             results.append({
-                "uid": str(component.uid.value) if hasattr(component, "uid") else "",
                 "summary": str(component.summary.value),
                 "start": str(component.dtstart.value),
                 "end": str(component.dtend.value)
@@ -70,136 +116,106 @@ def get_all_calendar_events(days_ahead=7):
                     all_events.extend(fetch_events_from_calendar(client_cal, ro_url, days_ahead))
         return all_events if all_events else "Aucun événement trouvé."
     except Exception as e:
-        return f"Erreur Radicale: {str(e)}"
+        return f"Erreur Radicale : {str(e)}"
 
 def create_calendar_event(summary: str, start_time: str, end_time: str):
-    """Crée un événement dans le calendrier Radicale principal."""
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
         calendar = client_cal.calendar(url=RADICALE_URL)
-        
         dt_start = datetime.datetime.fromisoformat(start_time)
         dt_end = datetime.datetime.fromisoformat(end_time)
-        
         calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary)
-        return f"Succès : l'événement '{summary}' a été créé."
+        return f"Succès : séance '{summary}' créée."
     except Exception as e:
-        return f"Erreur lors de la création : {str(e)}"
+        return f"Erreur création : {str(e)}"
 
 def update_calendar_event(summary_query: str, new_summary: str = None, new_start_time: str = None, new_end_time: str = None):
-    """Modifie un événement existant en cherchant par son titre (summary_query)."""
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
         calendar = client_cal.calendar(url=RADICALE_URL)
-        
         events = calendar.search(event=True)
-        target_event = None
         for e in events:
             comp = e.vobject_instance.vevent
             if summary_query.lower() in str(comp.summary.value).lower():
-                target_event = e
-                break
-                
-        if not target_event:
-            return f"Aucun événement trouvé correspondant à '{summary_query}'."
-            
-        comp = target_event.vobject_instance.vevent
-        if new_summary:
-            comp.summary.value = new_summary
-        if new_start_time:
-            comp.dtstart.value = datetime.datetime.fromisoformat(new_start_time)
-        if new_end_time:
-            comp.dtend.value = datetime.datetime.fromisoformat(new_end_time)
-            
-        target_event.save()
-        return f"Succès : l'événement '{summary_query}' a été mis à jour."
+                if new_summary:
+                    comp.summary.value = new_summary
+                if new_start_time:
+                    comp.dtstart.value = datetime.datetime.fromisoformat(new_start_time)
+                if new_end_time:
+                    comp.dtend.value = datetime.datetime.fromisoformat(new_end_time)
+                e.save()
+                return f"Succès : séance '{summary_query}' mise à jour."
+        return f"Aucun événement correspondant à '{summary_query}'."
     except Exception as e:
-        return f"Erreur lors de la modification : {str(e)}"
+        return f"Erreur mise à jour : {str(e)}"
 
 def delete_calendar_event(summary_query: str):
-    """Supprime un événement du calendrier en cherchant par son titre."""
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
         calendar = client_cal.calendar(url=RADICALE_URL)
-        
         events = calendar.search(event=True)
-        deleted_count = 0
+        count = 0
         for e in events:
             comp = e.vobject_instance.vevent
             if summary_query.lower() in str(comp.summary.value).lower():
                 e.delete()
-                deleted_count += 1
-                
-        if deleted_count > 0:
-            return f"Succès : {deleted_count} événement(s) correspondant à '{summary_query}' ont été supprimés."
-        return f"Aucun événement trouvé à supprimer pour '{summary_query}'."
+                count += 1
+        return f"Succès : {count} événement(s) supprimé(s)." if count > 0 else f"Aucun événement trouvé pour '{summary_query}'."
     except Exception as e:
-        return f"Erreur lors de la suppression : {str(e)}"
-
-def get_dreeve_data():
-    try:
-        headers = {"Authorization": f"Bearer {DREEVE_MCP_KEY}"}
-        res = requests.get(DREEVE_MCP_URL, headers=headers, timeout=5)
-        if res.status_code == 200:
-            return res.text[:1500]
-        return "Dreeve indisponible."
-    except Exception:
-        return "Dreeve indisponible."
+        return f"Erreur suppression : {str(e)}"
 
 # ------------------------------------------------------------------
-# DÉFINITION DES OUTILS POUR ANTHROPIC (Création, Édition, Suppression)
+# CONFIGURATION ANTHROPIC (Tools & System Prompt)
 # ------------------------------------------------------------------
 
 TOOLS = [
     {
         "name": "create_calendar_event",
-        "description": "Crée une nouvelle séance dans le calendrier Radicale principal.",
+        "description": "Crée une séance de course dans le calendrier Radicale principal.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "summary": {"type": "string", "description": "Titre de la séance"},
-                "start_time": {"type": "string", "description": "Début au format ISO 8601 (ex: 2026-11-09T18:00:00)"},
-                "end_time": {"type": "string", "description": "Fin au format ISO 8601 (ex: 2026-11-09T19:00:00)"}
+                "summary": {"type": "string"},
+                "start_time": {"type": "string"},
+                "end_time": {"type": "string"}
             },
             "required": ["summary", "start_time", "end_time"]
         }
     },
     {
         "name": "update_calendar_event",
-        "description": "Modifie un événement existant dans le calendrier Radicale en recherchant par son titre actuel.",
+        "description": "Modifie une séance dans l'agenda Radicale par recherche de titre.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "summary_query": {"type": "string", "description": "Le texte ou titre pour retrouver l'événement à modifier"},
-                "new_summary": {"type": "string", "description": "Nouveau titre (optionnel)"},
-                "new_start_time": {"type": "string", "description": "Nouvelle date/heure de début ISO 8601 (optionnel)"},
-                "new_end_time": {"type": "string", "description": "Nouvelle date/heure de fin ISO 8601 (optionnel)"}
+                "summary_query": {"type": "string"},
+                "new_summary": {"type": "string"},
+                "new_start_time": {"type": "string"},
+                "new_end_time": {"type": "string"}
             },
             "required": ["summary_query"]
         }
     },
     {
         "name": "delete_calendar_event",
-        "description": "Supprime un ou plusieurs événements du calendrier Radicale en cherchant par leur titre.",
+        "description": "Supprime une séance du calendrier Radicale.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "summary_query": {"type": "string", "description": "Le titre ou mot-clé de l'événement à supprimer"}
-            },
+            "properties": {"summary_query": {"type": "string"}},
             "required": ["summary_query"]
         }
     }
 ]
 
 SYSTEM_PROMPT = """
-Tu es un coach sportif expert, direct, concis et factuel. 
-Tu communiques via Telegram en utilisant STRICTEMENT un format Markdown propre et valide.
-Tu as la capacité totale de gérer l'agenda Radicale de l'utilisateur : tu peux créer, modifier ou supprimer des séances selon ses demandes.
-"""
+Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
+Tu communiques via Telegram en Markdown valide.
 
-# ------------------------------------------------------------------
-# BOUCLE D'EXÉCUTION DES OUTILS
-# ------------------------------------------------------------------
+DIRECTIVES SUR LES DONNÉES :
+1. N'affirme PAS que tu n'as pas accès à la météo ou à Dreeve sauf si le contexte t'indique explicitement une erreur de connexion réseau.
+2. Si des données sont temporairement indisponibles, fais au mieux avec les éléments de l'agenda Radicale pour planifier les séances.
+3. Utilise les outils de calendrier pour créer, modifier ou supprimer des séances quand l'utilisateur te le demande.
+"""
 
 def ask_claude_with_tools(user_prompt):
     weather_data = get_weather_forecast()
@@ -207,10 +223,12 @@ def ask_claude_with_tools(user_prompt):
     dreeve_data = get_dreeve_data()
     
     full_prompt = f"""
-Requête utilisateur : "{user_prompt}"
-- Météo : {weather_data}
-- Agendas : {calendar_data}
-- Dreeve : {dreeve_data}
+Message de l'utilisateur : "{user_prompt}"
+
+DONNÉES EN TEMPS RÉEL DU SYSTÈME :
+- Prévisions Météo : {weather_data}
+- Agendas Radicale (Running & Read-Only) : {calendar_data}
+- Données / Statut Dreeve (MCP) : {dreeve_data}
 """
 
     messages = [{"role": "user", "content": full_prompt}]
@@ -225,7 +243,6 @@ Requête utilisateur : "{user_prompt}"
 
     if response.stop_reason == "tool_use":
         messages.append({"role": "assistant", "content": response.content})
-        
         for block in response.content:
             if block.type == "tool_use":
                 tool_name = block.name
@@ -242,13 +259,11 @@ Requête utilisateur : "{user_prompt}"
                 
                 messages.append({
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": tool_result
-                        }
-                    ]
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_result
+                    }]
                 })
         
         final_response = anthropic_client.messages.create(
@@ -266,16 +281,16 @@ Requête utilisateur : "{user_prompt}"
             reply_text = block.text
             break
 
-    return reply_text if reply_text else "Action effectuée."
+    return reply_text if reply_text else "Opération terminée."
 
 # ------------------------------------------------------------------
-# TÂCHE PLANIFIÉE & TELEGRAM
+# TELEGRAM & FASTAPI
 # ------------------------------------------------------------------
 
 async def send_morning_briefing():
     if not telegram_app or not TELEGRAM_CHAT_ID:
         return
-    reply_text = ask_claude_with_tools("Fais un briefing matinal ultra-concis (checkup du jour).")
+    reply_text = ask_claude_with_tools("Fais un briefing matinal ultra-concis pour aujourd'hui.")
     await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=reply_text, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
