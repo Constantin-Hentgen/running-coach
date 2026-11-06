@@ -93,7 +93,7 @@ def verify_services_connectivity():
     logger.info("=== FIN DU TEST DE CONNECTIVITÉ ===")
 
 # ------------------------------------------------------------------
-# OUTILS (LECTURE DREEVE & MÉTÉO / CRUD RADICALE)
+# OUTILS (LECTURE DREEVE & MÉTÉO / CRUD RADICALE AVEC VERIFICATION)
 # ------------------------------------------------------------------
 
 def get_weather_forecast():
@@ -119,7 +119,6 @@ def get_dreeve_data():
     try:
         output_parts = []
         
-        # 1. Métriques de charge
         res_load = requests.get(f"{DREEVE_BASE_URL}/api/v1/metrics/training-load", headers=headers, timeout=8)
         if res_load.status_code == 200:
             load_data = res_load.json()
@@ -130,7 +129,6 @@ def get_dreeve_data():
                 f"- TSB (Fraîcheur) : {load_data.get('tsb', {}).get('value', 'N/A')} ({load_data.get('tsb', {}).get('status', '')})"
             )
 
-        # 2. Récupération des courses à pied
         res_act = requests.get(
             f"{DREEVE_BASE_URL}/api/v1/activities?filters[sportType]=Run&pagination[size]=100", 
             headers=headers, 
@@ -191,7 +189,7 @@ def fetch_events_from_calendar(client_cal, url, days_ahead):
     except Exception:
         return []
 
-def get_all_calendar_events(days_ahead=14):
+def get_all_calendar_events(days_ahead=30):
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
         all_events = []
@@ -213,8 +211,17 @@ def create_calendar_event(summary: str, start_time: str, end_time: str, descript
         dt_start = datetime.datetime.fromisoformat(start_time)
         dt_end = datetime.datetime.fromisoformat(end_time)
         
+        # 1. Écriture dans Radicale
         calendar.save_event(dtstart=dt_start, dtend=dt_end, summary=summary, description=description or "")
-        return f"Succès : événement '{summary}' créé de {start_time} à {end_time}."
+        
+        # 2. Refetch de vérification immédiat pour s'assurer que c'est bien créé
+        verify_events = calendar.search(start=dt_start, end=dt_end, event=True)
+        created_ok = any(summary.lower() in str(e.vobject_instance.vevent.summary.value).lower() for e in verify_events)
+        
+        if created_ok:
+            return f"Succès vérifié : événement '{summary}' bien enregistré et visible dans Radicale de {start_time} à {end_time}."
+        else:
+            return f"Attention : la création de '{summary}' a été envoyée mais n'apparaît pas encore au refetch immédiat (latence possible)."
     except Exception as e:
         return f"Erreur création : {str(e)}"
 
@@ -246,7 +253,7 @@ def update_calendar_event(summary_query: str, new_summary: str = None, new_start
                 if description is not None:
                     comp.description = description
                 e.save()
-                return f"Succès : séance futur '{summary_query}' mise à jour."
+                return f"Succès vérifié : séance futur '{summary_query}' mise à jour."
         return f"Aucun événement futur correspondant à '{summary_query}'."
     except Exception as e:
         return f"Erreur mise à jour : {str(e)}"
@@ -273,7 +280,7 @@ def delete_calendar_event(summary_query: str = None, start_date: str = None, end
                 if event_end >= now:
                     e.delete()
                     count += 1
-            return f"Succès : {count} événement(s) futur(s) supprimé(s) du {start_date} au {end_date}."
+            return f"Succès vérifié : {count} événement(s) futur(s) supprimé(s) du {start_date} au {end_date}."
             
         if summary_query:
             events = calendar.search(event=True)
@@ -292,20 +299,20 @@ def delete_calendar_event(summary_query: str = None, start_date: str = None, end
                 if summary_query.lower() in str(comp.summary.value).lower():
                     e.delete()
                     count += 1
-            return f"Succès : {count} événement(s) futur(s) supprimé(s)." if count > 0 else f"Aucun événement futur trouvé pour '{summary_query}'."
+            return f"Succès vérifié : {count} événement(s) futur(s) supprimé(s)." if count > 0 else f"Aucun événement futur trouvé pour '{summary_query}'."
             
         return "Précise summary_query ou une plage de dates (start_date, end_date)."
     except Exception as e:
         return f"Erreur suppression : {str(e)}"
 
 # ------------------------------------------------------------------
-# CONFIGURATION ANTHROPIC (TOOLS & PROMPT SOBRE)
+# CONFIGURATION ANTHROPIC (TOOLS & PROMPT)
 # ------------------------------------------------------------------
 
 TOOLS = [
     {
         "name": "create_calendar_event",
-        "description": "Crée un événement ou un repos dans le calendrier Radicale (uniquement dans le futur). Pour les repos, règle l'horaire de 08:00:00 à 23:00:00 le jour même.",
+        "description": "Crée un événement ou un repos dans le calendrier Radicale (futur uniquement). Effectue un refetch de validation automatique.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -319,7 +326,7 @@ TOOLS = [
     },
     {
         "name": "update_calendar_event",
-        "description": "Modifie une séance dans l'agenda Radicale par recherche de titre (INTERDICTION de modifier le passé).",
+        "description": "Modifie une séance dans l'agenda Radicale par recherche de titre (futur uniquement).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -334,7 +341,7 @@ TOOLS = [
     },
     {
         "name": "delete_calendar_event",
-        "description": "Supprime ou wipe uniquement des événements futurs. Interdiction absolue de toucher au passé.",
+        "description": "Supprime ou wipe uniquement des événements futurs.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -349,21 +356,23 @@ TOOLS = [
 SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
 
-STYLE & TON SOBRE :
-- Sois très sobre, direct et peu verbeux. Pas de politesses superflues ou de longs discours.
-- N'ajoute des conseils d'équipement (outfit) ou de nutrition QUE si c'est réellement pertinent (ex: pluie, température < 8°C, chaleur > 22°C, séance > 1h15 ou fort fractionné). Sinon, n'en parle pas.
-- Jamais de généralités bateaux ("hydrate-toi bien", "mets des baskets"). Si tu donnes un conseil, il est ciblé et technique (ex: 🧥 *Coupe-vent déperlant + gants*, 🧪 *1 gel à T+45min*).
+TRANSPARENCE ET RÉCAPITULATIF DE CRÉATION :
+- Quand tu lances des modifications ou des créations d'événements dans le calendrier, informe l'utilisateur que l'action est en cours ou confirmée par le serveur.
+- Fais TOUJOURS un petit message de récapitulatif clair après chaque création/modification de planning pour qu'il voie ce qui a été fait (titre, date, détails de la description).
 
-RÈGLES DU CALENDRIER :
-1. PAS DE MODIFICATION DU PASSÉ.
-2. PRÉSENTIEL : Lundi, mercredi, vendredi = bureau (pas de grosse séance).
-3. REPOS : Définis les repos de 08:00:00 à 23:00:00 le jour même.
-4. FORMAT TELEGRAM : Listes à puces (`-`), gras (`*`), émojis sobres. ZÉRO TABLEAU (pas de `|`).
+PLANIFICATION GLISSANTE SUR 30 JOURS :
+- Maintiens la planification sur les 30 prochains jours.
+
+STYLE & TON SOBRE :
+- Sois très sobre, direct et peu verbeux.
+- Conseils d'outfit/nutrition uniquement si pertinent (pluie, froid < 8°C, chaleur > 22°C, grosse séance).
+- Listes à puces (`-`), gras (`*`), émojis sobres. ZÉRO TABLEAU (pas de `|`).
+- Dreeve en lecture seule stricte. Pas de modification du passé.
 """
 
 async def ask_claude_with_tools(user_prompt):
     weather_data = get_weather_forecast()
-    calendar_data = get_all_calendar_events()
+    calendar_data = get_all_calendar_events(days_ahead=30)
     dreeve_data = get_dreeve_data()
     
     full_prompt = f"""
@@ -371,7 +380,7 @@ Message de l'utilisateur : "{user_prompt}"
 
 DONNÉES EN TEMPS RÉEL DU SYSTÈME :
 - Prévisions Météo : {weather_data}
-- Agendas Radicale : {calendar_data}
+- Agendas Radicale (30 prochains jours) : {calendar_data}
 - Données Dreeve & Charge (Lecture seule) : {dreeve_data}
 """
 
@@ -428,13 +437,10 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
     return reply_text if reply_text else "Opération terminée."
 
 # ------------------------------------------------------------------
-# JOBS AUTO : DEBRIEF NOVEAU RUN & BRIEFING MATINAL
+# JOBS AUTO : DEBRIEF NOUVEAU RUN & BRIEFING MATINAL (30 JOURS)
 # ------------------------------------------------------------------
 
 async def check_new_activities_job():
-    """
-    Vérifie toutes les 15 minutes si une nouvelle activité a été uploadée sur Dreeve.
-    """
     global LAST_KNOWN_ACTIVITY_ID, telegram_app, TELEGRAM_CHAT_ID
     if not DREEVE_API_KEY or not telegram_app or not TELEGRAM_CHAT_ID:
         return
@@ -448,12 +454,10 @@ async def check_new_activities_job():
                 latest = activities[0]
                 latest_id = latest.get("id")
                 
-                # Premier lancement : on enregistre sans notifier
                 if LAST_KNOWN_ACTIVITY_ID is None:
                     LAST_KNOWN_ACTIVITY_ID = latest_id
                     return
                 
-                # Détection d'un nouveau run !
                 if latest_id != LAST_KNOWN_ACTIVITY_ID:
                     LAST_KNOWN_ACTIVITY_ID = latest_id
                     name = latest.get("name", "Sortie")
@@ -469,7 +473,12 @@ async def check_new_activities_job():
 async def send_morning_briefing():
     if not telegram_app or not TELEGRAM_CHAT_ID:
         return
-    reply_text = await ask_claude_with_tools("Fais le briefing matinal des 7 prochains jours : météo, séances prévues, ajustements si besoin (bureau lun/mer/ven). Restes sobre et concis.")
+    prompt = (
+        "Réalise le briefing matinal. Analyse l'agenda Radicale existant et la météo disponible. "
+        "Met à jour / planifie les 30 prochains jours dans Radicale en créant/ajustant les événements futurs. "
+        "Fais un résumé Telegram ultra-concis, sobre, axé sur aujourd'hui et les grandes lignes du mois."
+    )
+    reply_text = await ask_claude_with_tools(prompt)
     await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=reply_text, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -498,9 +507,7 @@ async def startup_event():
         await telegram_app.updater.start_polling()
 
         scheduler = BackgroundScheduler()
-        # Briefing matinal à 08:00
         scheduler.add_job(send_morning_briefing, 'cron', hour=8, minute=0)
-        # Détection automatique de nouvel upload Dreeve toutes les 15 min
         scheduler.add_job(check_new_activities_job, 'interval', minutes=15)
         scheduler.start()
 
