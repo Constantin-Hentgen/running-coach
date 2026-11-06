@@ -5,6 +5,7 @@ import caldav
 import anthropic
 from fastapi import FastAPI
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 app = FastAPI()
@@ -12,31 +13,33 @@ app = FastAPI()
 # Configuration via variables d'environnement
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-RADICALE_URL = os.getenv("RADICALE_URL")  # ex: http://radicale:5232/constantin/24612253-54d0-6121-fbf.../
+RADICALE_URL = os.getenv("RADICALE_URL")
 RADICALE_USER = os.getenv("RADICALE_USER")
 RADICALE_PASS = os.getenv("RADICALE_PASS")
 DREEVE_MCP_KEY = os.getenv("DREEVE_MCP_KEY")
 DREEVE_MCP_URL = os.getenv("DREEVE_MCP_URL", "https://sport.hentgen.ovh/mcp")
-CITY_LAT_LON = (48.8566, 2.3522)  # Vos coordonnées (ex: Paris)
+CITY_LAT_LON = (48.8566, 2.3522)  # Coordonnées pour la météo (ex: Paris)
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ------------------------------------------------------------------
-# OUTILS ET INTÉGRATIONS (CalDAV, Dreeve MCP, Météo)
+# OUTILS ET INTÉGRATIONS
 # ------------------------------------------------------------------
 
 def get_weather_forecast():
     """Récupère la météo et les précipitations pour les 7 prochains jours."""
-    lat, lon = CITY_LAT_LON
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max&timezone=auto"
-    res = requests.get(url).json()
-    return res.get("daily", {})
+    try:
+        lat, lon = CITY_LAT_LON
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max&timezone=auto"
+        res = requests.get(url, timeout=5).json()
+        return res.get("daily", {})
+    except Exception as e:
+        return f"Erreur météo: {str(e)}"
 
 def get_calendar_events(days_ahead=7):
-    """Lit les événements du calendrier dédié running sur Radicale via son UUID."""
+    """Lit les événements du calendrier dédié running sur Radicale."""
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
-        # En pointant directement sur l'URL de la collection/UUID, on cible le calendrier exact
         calendar = client_cal.calendar(url=RADICALE_URL)
         
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -51,44 +54,43 @@ def get_calendar_events(days_ahead=7):
                 "start": str(component.dtstart.value),
                 "end": str(component.dtend.value)
             })
-        return results
+        return results if results else "Aucune séance prévue dans l'agenda."
     except Exception as e:
-        return f"Erreur de lecture Radicale: {str(e)}"
+        return f"Erreur Radicale: {str(e)}"
 
 def get_dreeve_data():
-    """Interroge le serveur MCP Dreeve pour récupérer les activités et métriques."""
+    """Interroge le serveur MCP Dreeve."""
     try:
         headers = {"Authorization": f"Bearer {DREEVE_MCP_KEY}"}
-        # Dreeve expose son serveur MCP compatible HTTP sur /mcp
-        res = requests.get(DREEVE_MCP_URL, headers=headers)
+        res = requests.get(DREEVE_MCP_URL, headers=headers, timeout=5)
         if res.status_code == 200:
-            return res.json()
-        return f"Statut MCP Dreeve (Code {res.status_code})"
+            return res.text[:2000]  # Limite pour éviter d'exploser le contexte
+        return f"Dreeve indisponible (Code HTTP {res.status_code})"
     except Exception as e:
-        return f"Erreur de connexion Dreeve MCP: {str(e)}"
+        return f"Erreur Dreeve MCP: {str(e)}"
 
 # ------------------------------------------------------------------
-# PROMPT DU COACH
+# PROMPT SYSTEM
 # ------------------------------------------------------------------
 
 SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert et un assistant d'organisation.
-Tu communiques via Telegram en langage naturel.
+Tu communiques via Telegram.
 
 CONTRAINTES & PRÉFÉRENCES UTILISATEUR :
 1. Télétravail par défaut : Mardi et Jeudi.
 2. Jours de course privilégiés : Mardi, Jeudi et le Weekend.
-3. Durée maximale en semaine : 1h en porte-à-porte (créneau de pause déjeuner ou fin de journée).
-4. Prise en compte impérative de la MÉTÉO (éviter la pluie forte ou les températures extrêmes).
-5. Utilise les données d'entraînement Dreeve pour évaluer la charge et la fatigue.
-6. Consulte l'agenda Radicale dédié au running pour vérifier les créneaux libres.
+3. Durée maximale en semaine : 1h en porte-à-porte.
+4. Prise en compte impérative de la MÉTÉO (éviter pluie forte/vent violent).
+5. Évalue les données Dreeve si disponibles. Si Dreeve est indisponible, continue en te basant sur l'agenda et la météo.
+6. Consulte l'agenda Radicale pour vérifier les créneaux libres.
 
 RÔLE :
-Analyse les requêtes de l'utilisateur, croise les données météo, l'agenda et l'historique Dreeve pour lui donner des conseils de coaching pertinents ou l'aider à planifier ses séances.
+Propose des conseils et un planning optimisé. Format tes réponses avec un Markdown propre et lisible pour Telegram.
 """
 
 # ------------------------------------------------------------------
-# BOT TELEGRAM & FASTAPI
+# BOT TELEGRAM
 # ------------------------------------------------------------------
 
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,20 +107,19 @@ Message de l'utilisateur : "{user_text}"
 
 Contexte actuel :
 - Météo (7 prochains jours) : {weather_data}
-- Agenda Radicale (Running UUID) : {calendar_data}
+- Agenda Radicale (Running) : {calendar_data}
 - Données Dreeve (MCP) : {dreeve_data}
 """
 
-    # Utilisation du modèle demandé par l'utilisateur
+    # Augmentation de max_tokens pour éviter la réponse coupée avec Haiku 5.5
     response = anthropic_client.messages.create(
         model="claude-haiku-5-5",
-        max_tokens=1024,
+        max_tokens=2048,
         system=SYSTEM_PROMPT,
-        messages=[
-            {"role": "user", "content": prompt_with_context}
-        ]
+        messages=[{"role": "user", "content": prompt_with_context}]
     )
 
+    # Extraction spécifique du bloc de texte
     reply_text = ""
     for block in response.content:
         if getattr(block, "type", None) == "text":
@@ -128,7 +129,12 @@ Contexte actuel :
     if not reply_text:
         reply_text = "Désolé, je n'ai pas pu générer de réponse."
 
-    await update.message.reply_text(reply_text)
+    # Activation de parse_mode=ParseMode.MARKDOWN pour corriger le rendu
+    try:
+        await update.message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        # Fallback si le Markdown renvoyé par le modèle contient des caractères non échappés
+        await update.message.reply_text(reply_text)
 
 telegram_app = None
 
@@ -141,7 +147,7 @@ async def startup_event():
         await telegram_app.initialize()
         await telegram_app.start()
         await telegram_app.updater.start_polling()
-        print("Bot Telegram démarré en arrière-plan avec uv.")
+        print("Bot Telegram prêt.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -152,4 +158,4 @@ async def shutdown_event():
 
 @app.get("/health")
 def health_check():
-    return {"status": "running", "engine": "uv"}
+    return {"status": "running"}
