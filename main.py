@@ -11,7 +11,6 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# Configuration des logs en mode INFO visible dans les logs Docker
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -20,17 +19,14 @@ logger = logging.getLogger("RunningCoachAgent")
 
 app = FastAPI()
 
-# Configuration des variables d'environnement
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 RADICALE_URL = os.getenv("RADICALE_URL")
-RADICALE_READONLY_URLS = os.getenv("RADICALE_READONLY_URLS", "")
 RADICALE_USER = os.getenv("RADICALE_USER")
 RADICALE_PASS = os.getenv("RADICALE_PASS")
 DREEVE_API_KEY = os.getenv("DREEVE_API_KEY")
 
-# Nettoyage automatique de l'URL de base Dreeve
 raw_dreeve_url = os.getenv("DREEVE_API_URL", "https://sport.hentgen.ovh")
 DREEVE_BASE_URL = raw_dreeve_url.split("/mcp")[0].split("/api")[0].rstrip("/")
 
@@ -40,14 +36,8 @@ anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 telegram_app = None
 LAST_KNOWN_ACTIVITY_ID = None
 
-# GESTION DE LA MÉMOIRE / HISTORIQUE CONVERSATIONNEL (PAR USER / CHAT)
-# Stocke les N derniers messages d'échange pour chaque utilisateur
 USER_CONVERSATION_HISTORY = defaultdict(list)
-MAX_HISTORY_MESSAGES = 6  # 3 questions + 3 réponses
-
-# ------------------------------------------------------------------
-# TEST DE CONNECTIVITÉ LOGUÉ AU DÉMARRAGE
-# ------------------------------------------------------------------
+MAX_HISTORY_MESSAGES = 6
 
 def verify_services_connectivity():
     logger.info("=== LANCE LE TEST DE CONNECTIVITÉ DES SERVICES ===")
@@ -60,17 +50,14 @@ def verify_services_connectivity():
 
     if DREEVE_API_KEY:
         headers = {"Authorization": f"Bearer {DREEVE_API_KEY}", "Accept": "application/json"}
-        
-        target_status_url = f"{DREEVE_BASE_URL}/api/v1/status"
         try:
-            res_status = requests.get(target_status_url, headers=headers, timeout=5)
+            res_status = requests.get(f"{DREEVE_BASE_URL}/api/v1/status", headers=headers, timeout=5)
             logger.info(f"[DREEVE] Réponse Statut — HTTP {res_status.status_code} : {res_status.text}")
         except Exception as e:
-            logger.error(f"[DREEVE] Erreur de connexion à {target_status_url} : {e}")
+            logger.error(f"[DREEVE] Erreur statut : {e}")
 
-        target_load_url = f"{DREEVE_BASE_URL}/api/v1/metrics/training-load"
         try:
-            res_load = requests.get(target_load_url, headers=headers, timeout=5)
+            res_load = requests.get(f"{DREEVE_BASE_URL}/api/v1/metrics/training-load", headers=headers, timeout=5)
             logger.info(f"[DREEVE] Réponse Training Load — HTTP {res_load.status_code} : {res_load.text}")
         except Exception as e:
             logger.error(f"[DREEVE] Erreur training-load : {e}")
@@ -91,16 +78,12 @@ def verify_services_connectivity():
     else:
         try:
             client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
-            client_cal.principal()
-            logger.info("[RADICALE] CalDAV OK : Connexion à l'agenda établie.")
+            client_cal.calendar(url=RADICALE_URL)
+            logger.info("[RADICALE] CalDAV OK : Connexion à l'agenda unique établie.")
         except Exception as e:
             logger.error(f"[RADICALE] Échec de connexion au calendrier CalDAV : {e}")
 
     logger.info("=== FIN DU TEST DE CONNECTIVITÉ ===")
-
-# ------------------------------------------------------------------
-# OUTILS (LECTURE DREEVE & MÉTÉO / CRUD RADICALE)
-# ------------------------------------------------------------------
 
 def get_weather_forecast():
     try:
@@ -172,12 +155,13 @@ def get_dreeve_data():
 
         return "\n\n".join(output_parts) if output_parts else "Aucune donnée Dreeve disponible."
     except Exception as e:
-        logger.error(f"Erreur lors de la récupération des données Dreeve : {e}")
+        logger.error(f"Erreur Dreeve : {e}")
         return f"Erreur requête API Dreeve : {str(e)}"
 
-def fetch_events_from_calendar(client_cal, url, days_ahead):
+def get_all_calendar_events(days_ahead=30):
     try:
-        calendar = client_cal.calendar(url=url.strip())
+        client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
+        calendar = client_cal.calendar(url=RADICALE_URL)
         now = datetime.datetime.now(datetime.timezone.utc)
         end = now + datetime.timedelta(days=days_ahead)
         events = calendar.search(start=now, end=end, event=True)
@@ -191,22 +175,9 @@ def fetch_events_from_calendar(client_cal, url, days_ahead):
                 "end": str(component.dtend.value),
                 "description": desc
             })
-        return results
-    except Exception:
-        return []
-
-def get_all_calendar_events(days_ahead=30):
-    try:
-        client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
-        all_events = []
-        if RADICALE_URL:
-            all_events.extend(fetch_events_from_calendar(client_cal, RADICALE_URL, days_ahead))
-        if RADICALE_READONLY_URLS:
-            for ro_url in RADICALE_READONLY_URLS.split(","):
-                if ro_url.strip():
-                    all_events.extend(fetch_events_from_calendar(client_cal, ro_url, days_ahead))
-        return all_events if all_events else "Aucun événement trouvé."
+        return results if results else "Aucun événement trouvé."
     except Exception as e:
+        logger.error(f"Erreur lecture Radicale : {e}")
         return f"Erreur Radicale : {str(e)}"
 
 def create_calendar_event(summary: str, start_time: str, end_time: str, description: str = None):
@@ -225,8 +196,9 @@ def create_calendar_event(summary: str, start_time: str, end_time: str, descript
         if created_ok:
             return f"Succès vérifié : événement '{summary}' bien enregistré et visible dans Radicale de {start_time} à {end_time}."
         else:
-            return f"Attention : la création de '{summary}' a été envoyée mais n'apparaît pas encore au refetch immédiat (latence possible)."
+            return f"Attention : la création de '{summary}' a été envoyée mais n'apparaît pas encore au refetch immédiat."
     except Exception as e:
+        logger.error(f"Erreur création CalDAV : {e}")
         return f"Erreur création : {str(e)}"
 
 def update_calendar_event(summary_query: str, new_summary: str = None, new_start_time: str = None, new_end_time: str = None, description: str = None):
@@ -260,6 +232,7 @@ def update_calendar_event(summary_query: str, new_summary: str = None, new_start
                 return f"Succès vérifié : séance futur '{summary_query}' mise à jour."
         return f"Aucun événement futur correspondant à '{summary_query}'."
     except Exception as e:
+        logger.error(f"Erreur mise à jour CalDAV : {e}")
         return f"Erreur mise à jour : {str(e)}"
 
 def delete_calendar_event(summary_query: str = None, start_date: str = None, end_date: str = None):
@@ -307,16 +280,13 @@ def delete_calendar_event(summary_query: str = None, start_date: str = None, end
             
         return "Précise summary_query ou une plage de dates (start_date, end_date)."
     except Exception as e:
+        logger.error(f"Erreur suppression CalDAV : {e}")
         return f"Erreur suppression : {str(e)}"
-
-# ------------------------------------------------------------------
-# CONFIGURATION ANTHROPIC (TOOLS & PROMPT)
-# ------------------------------------------------------------------
 
 TOOLS = [
     {
         "name": "create_calendar_event",
-        "description": "Crée un événement ou un repos dans le calendrier Radicale (futur uniquement). Effectue un refetch de validation automatique.",
+        "description": "Crée un événement ou un repos dans l'unique calendrier Radicale (futur uniquement). Effectue un refetch de validation automatique.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -330,7 +300,7 @@ TOOLS = [
     },
     {
         "name": "update_calendar_event",
-        "description": "Modifie une séance dans l'agenda Radicale par recherche de titre (futur uniquement).",
+        "description": "Modifie une séance dans l'unique calendrier Radicale par recherche de titre (futur uniquement).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -345,7 +315,7 @@ TOOLS = [
     },
     {
         "name": "delete_calendar_event",
-        "description": "Supprime ou wipe uniquement des événements futurs.",
+        "description": "Supprime ou wipe uniquement des événements futurs dans l'unique calendrier Radicale.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -360,13 +330,12 @@ TOOLS = [
 SYSTEM_PROMPT = """
 Tu es un coach sportif personnel expert, direct, concis et ultra-factuel.
 
-HISTORIQUE ET CONTEXTE :
-- Tu as accès aux échanges récents avec l'utilisateur pour conserver la continuité de la discussion.
-- Fais référence de manière naturelle aux questions ou préférences précédentes sans être lourd.
+SÉCURITÉ ET ACCÈS UNIQUE :
+- Tu interges exclusivement l'unique calendrier configuré via RADICALE_URL. Aucun autre calendrier n'est accessible ou autorisé.
 
 TRANSPARENCE TOTALE ET RÈGLE DES ÉTAPES :
-1. STATUT EN COURS : Si tu t'apprêtes à exécuter des modifications ou créations d'événements, annonce-le clairement ("⏳ Action en cours...").
-2. VALIDATION ET RÉCAPITULATIF : Une fois les outils exécutés et validés par le serveur, envoie un récapitulatif net et précis de ce qui a été fait.
+1. STATUT EN COURS : Si tu t'apprêtes à exécuter des modifications ou créations, annonce-le clairement ("⏳ Action en cours...").
+2. VALIDATION ET RÉCAPITULATIF : Une fois les outils exécutés et validés, envoie un récapitulatif net de ce qui a été fait.
 
 PLANIFICATION GLISSANTE SUR 30 JOURS :
 - Maintiens la planification sur les 30 prochains jours.
@@ -383,23 +352,19 @@ async def ask_claude_with_tools(user_prompt, chat_id="default"):
     calendar_data = get_all_calendar_events(days_ahead=30)
     dreeve_data = get_dreeve_data()
     
-    # Injection du contexte système en temps réel
     system_context_block = f"""
 DONNÉES EN TEMPS RÉEL DU SYSTÈME :
 - Prévisions Météo : {weather_data}
-- Agendas Radicale (30 prochains jours) : {calendar_data}
+- Agenda Radicale Unique (30 prochains jours) : {calendar_data}
 - Données Dreeve & Charge (Lecture seule) : {dreeve_data}
 """
 
-    # Récupération de l'historique conversationnel récents du user
     history = USER_CONVERSATION_HISTORY[chat_id]
     
     messages = []
-    # Copie de l'historique (les N derniers messages)
     for msg in history[-MAX_HISTORY_MESSAGES:]:
         messages.append(msg)
         
-    # Ajout du message courant enrichi du contexte temps réel
     current_message_content = f"{system_context_block}\n\nMessage de l'utilisateur : \"{user_prompt}\""
     messages.append({"role": "user", "content": current_message_content})
     
@@ -451,20 +416,14 @@ DONNÉES EN TEMPS RÉEL DU SYSTÈME :
             reply_text = block.text
             break
 
-    # Mise à jour du buffer d'historique de conversation
     USER_CONVERSATION_HISTORY[chat_id].append({"role": "user", "content": user_prompt})
     if reply_text:
         USER_CONVERSATION_HISTORY[chat_id].append({"role": "assistant", "content": reply_text})
     
-    # Maintien du buffer à la taille maximale autorisée
     if len(USER_CONVERSATION_HISTORY[chat_id]) > MAX_HISTORY_MESSAGES:
         USER_CONVERSATION_HISTORY[chat_id] = USER_CONVERSATION_HISTORY[chat_id][-MAX_HISTORY_MESSAGES:]
 
     return reply_text if reply_text else "Opération terminée."
-
-# ------------------------------------------------------------------
-# JOBS AUTO : DEBRIEF NOUVEAU RUN & BRIEFING MATINAL (30 JOURS)
-# ------------------------------------------------------------------
 
 async def check_new_activities_job():
     global LAST_KNOWN_ACTIVITY_ID, telegram_app, TELEGRAM_CHAT_ID
