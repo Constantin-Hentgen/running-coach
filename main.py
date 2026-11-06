@@ -10,7 +10,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# Configuration des logs en mode INFO visible dans Docker
+# Configuration des logs en mode INFO visible dans les logs Docker
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -28,7 +28,11 @@ RADICALE_READONLY_URLS = os.getenv("RADICALE_READONLY_URLS", "")
 RADICALE_USER = os.getenv("RADICALE_USER")
 RADICALE_PASS = os.getenv("RADICALE_PASS")
 DREEVE_API_KEY = os.getenv("DREEVE_API_KEY")
-DREEVE_URL = os.getenv("DREEVE_API_URL", "https://sport.hentgen.ovh")
+
+# Nettoyage automatique de l'URL de base Dreeve
+raw_dreeve_url = os.getenv("DREEVE_API_URL", "https://sport.hentgen.ovh")
+DREEVE_BASE_URL = raw_dreeve_url.split("/mcp")[0].split("/api")[0].rstrip("/")
+
 CITY_LAT_LON = (48.8566, 2.3522)
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -41,31 +45,32 @@ telegram_app = None
 def verify_services_connectivity():
     logger.info("=== LANCE LE TEST DE CONNECTIVITÉ DES SERVICES ===")
     
-    # 1. Test Dreeve (Status + Training Load)
+    # Audit de la clé Dreeve
     if not DREEVE_API_KEY:
-        logger.error("[DREEVE] DREEVE_API_KEY n'est pas configurée !")
+        logger.error("[DREEVE] DREEVE_API_KEY est VIDE ou non définie !")
     else:
-        headers = {"Authorization": f"Bearer {DREEVE_API_KEY}", "Accept": "application/json"}
-        base_url = DREEVE_URL.rstrip('/')
-        
-        try:
-            res_status = requests.get(f"{base_url}/api/v1/status", headers=headers, timeout=5)
-            if res_status.status_code == 200:
-                logger.info("[DREEVE] Statut API OK : Connexion établie et token valide.")
-            else:
-                logger.warning(f"[DREEVE] Statut API renvoie un code HTTP {res_status.status_code} : {res_status.text}")
-        except Exception as e:
-            logger.error(f"[DREEVE] Erreur critique de connexion à l'URL {base_url} : {e}")
+        masked_key = f"{DREEVE_API_KEY[:6]}...{DREEVE_API_KEY[-4:]}" if len(DREEVE_API_KEY) > 10 else "KEY_TOO_SHORT"
+        logger.info(f"[DREEVE] Clé détectée (masquée) : {masked_key}")
 
+    # 1. Test Dreeve (Status + Training Load)
+    if DREEVE_API_KEY:
+        headers = {"Authorization": f"Bearer {DREEVE_API_KEY}", "Accept": "application/json"}
+        
+        target_status_url = f"{DREEVE_BASE_URL}/api/v1/status"
+        logger.info(f"[DREEVE] Test URL Statut : {target_status_url}")
         try:
-            res_load = requests.get(f"{base_url}/api/v1/metrics/training-load", headers=headers, timeout=5)
-            if res_load.status_code == 200:
-                data = res_load.json()
-                logger.info(f"[DREEVE] Training Load récupéré avec succès — CTL: {data.get('ctl')}, ATL: {data.get('atl')}")
-            else:
-                logger.warning(f"[DREEVEE] Training Load refusé (HTTP {res_load.status_code}) : {res_load.text}")
+            res_status = requests.get(target_status_url, headers=headers, timeout=5)
+            logger.info(f"[DREEVE] Réponse Statut — HTTP {res_status.status_code} : {res_status.text}")
         except Exception as e:
-            logger.error(f"[DREEVE] Impossible de récupérer le training load : {e}")
+            logger.error(f"[DREEVE] Erreur de connexion à {target_status_url} : {e}")
+
+        target_load_url = f"{DREEVE_BASE_URL}/api/v1/metrics/training-load"
+        logger.info(f"[DREEVE] Test URL Training Load : {target_load_url}")
+        try:
+            res_load = requests.get(target_load_url, headers=headers, timeout=5)
+            logger.info(f"[DREEVE] Réponse Training Load — HTTP {res_load.status_code} : {res_load.text}")
+        except Exception as e:
+            logger.error(f"[DREEVE] Erreur training-load : {e}")
 
     # 2. Test Météo (Open-Meteo)
     try:
@@ -75,9 +80,9 @@ def verify_services_connectivity():
         if res_weather.status_code == 200:
             logger.info("[METEO] Open-Meteo OK : Prévisions accessibles.")
         else:
-            logger.warning(f"[METEO] Open-Meteo a répondu avec le code {res_weather.status_code}")
+            logger.warning(f"[METEO] Code HTTP inattendu : {res_weather.status_code}")
     except Exception as e:
-        logger.error(f"[METEO] Erreur de connexion Open-Meteo : {e}")
+        logger.error(f"[METEO] Erreur Open-Meteo : {e}")
 
     # 3. Test Radicale / CalDAV
     if not RADICALE_URL:
@@ -86,7 +91,7 @@ def verify_services_connectivity():
         try:
             client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
             client_cal.principal()
-            logger.info("[RADICALE] CalDAV OK : Connexion à l'agenda établie avec succès.")
+            logger.info("[RADICALE] CalDAV OK : Connexion à l'agenda établie.")
         except Exception as e:
             logger.error(f"[RADICALE] Échec de connexion au calendrier CalDAV : {e}")
 
@@ -114,7 +119,6 @@ def get_dreeve_data():
     if not DREEVE_API_KEY:
         return "Clé Dreeve non configurée."
 
-    base_url = DREEVE_URL.rstrip('/')
     headers = {
         "Authorization": f"Bearer {DREEVE_API_KEY}",
         "Accept": "application/json"
@@ -123,8 +127,8 @@ def get_dreeve_data():
     try:
         output_parts = []
         
-        # 1. Métriques de charge (Training Load : CTL, ATL, TSB...)
-        res_load = requests.get(f"{base_url}/api/v1/metrics/training-load", headers=headers, timeout=8)
+        # 1. Métriques de charge
+        res_load = requests.get(f"{DREEVE_BASE_URL}/api/v1/metrics/training-load", headers=headers, timeout=8)
         if res_load.status_code == 200:
             load_data = res_load.json()
             output_parts.append(
@@ -133,8 +137,8 @@ def get_dreeve_data():
                 f"- TSB (Fraîcheur) : {load_data.get('tsb', {}).get('value', 'N/A')} ({load_data.get('tsb', {}).get('status', '')})"
             )
 
-        # 2. Activités récentes via GET /api/v1/activities
-        res_act = requests.get(f"{base_url}/api/v1/activities?pagination[size]=3", headers=headers, timeout=8)
+        # 2. Activités récentes
+        res_act = requests.get(f"{DREEVE_BASE_URL}/api/v1/activities?pagination[size]=3", headers=headers, timeout=8)
         if res_act.status_code == 200:
             data = res_act.json()
             activities = data.get("activities", [])
@@ -142,7 +146,6 @@ def get_dreeve_data():
             for act in activities:
                 name = act.get("name", "Sortie")
                 date = act.get("startDateLocal", "Date inconnue")
-                # Gestion de la distance si présente dans l'objet
                 summary_list.append(f"- {date} : {name}")
             if summary_list:
                 output_parts.append("Dernières activités :\n" + "\n".join(summary_list))
