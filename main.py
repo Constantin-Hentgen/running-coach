@@ -189,7 +189,7 @@ def fetch_events_from_calendar(client_cal, url, days_ahead):
     except Exception:
         return []
 
-def get_all_calendar_events(days_ahead=30):
+def get_all_calendar_events(days_ahead=100):
     try:
         client_cal = caldav.DAVClient(url=RADICALE_URL, username=RADICALE_USER, password=RADICALE_PASS)
         all_events = []
